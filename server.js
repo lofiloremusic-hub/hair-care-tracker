@@ -10,8 +10,9 @@ const PORT = process.env.PORT || 3000;
 // Allow requests from your Firebase Hosting domain only.
 // During development, also allow localhost.
 const allowedOrigins = [
+  'https://jordyn-haircare.web.app',
+  'https://jordyn-haircare.firebaseapp.com',
   'https://hair-care-tracker.web.app',
-  'https://hair-care-tracker.firebaseapp.com',
   'http://localhost:5000',
   'http://127.0.0.1:5500'
 ];

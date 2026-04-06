@@ -98,6 +98,13 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
+// Keep-alive ping — prevents Render free tier from sleeping
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'http://localhost:' + PORT;
+setInterval(function() {
+  require('https').get(SELF_URL).on('error', function(){});
+}, 14 * 60 * 1000); // ping every 14 minutes
+
+
 // ── START ─────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n✅  Server running → http://localhost:${PORT}`);

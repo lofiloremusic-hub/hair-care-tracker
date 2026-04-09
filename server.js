@@ -8,7 +8,6 @@ const http = require('http');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ── CORS ─────────────────────────────────────────────────────────
 const allowedOrigins = [
   'https://jordyn-haircare.web.app',
   'https://jordyn-haircare.firebaseapp.com',
@@ -29,9 +28,8 @@ app.use(cors({
 
 app.use(express.json({ limit: '10kb' }));
 
-// ── GEMINI SETUP ─────────────────────────────────────────────────
 if (!process.env.GEMINI_API_KEY) {
-  console.error('❌ GEMINI_API_KEY is not set. Add it in .env or Render environment variables.');
+  console.error('GEMINI_API_KEY is not set.');
   process.exit(1);
 }
 
@@ -45,7 +43,6 @@ const model = genAI.getGenerativeModel({
   }
 });
 
-// ── HEALTH CHECK ─────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
@@ -53,31 +50,27 @@ app.get('/', (req, res) => {
   });
 });
 
-// ── TEST GEMINI ROUTE ────────────────────────────────────────────
 app.get('/test-gemini', async (req, res) => {
   try {
     const result = await model.generateContent('Say hello in one short sentence.');
-    const reply = result?.response?.text?.() || '';
+    const reply = result && result.response ? result.response.text() : '';
 
     res.json({
       ok: true,
-      reply
+      reply: reply
     });
   } catch (err) {
     console.error('TEST GEMINI FULL ERROR:', err);
-    console.error('TEST GEMINI MESSAGE:', err?.message);
-    console.error('TEST GEMINI STACK:', err?.stack);
+    console.error('TEST GEMINI MESSAGE:', err && err.message);
+    console.error('TEST GEMINI STACK:', err && err.stack);
 
     res.status(500).json({
       ok: false,
-      message: err?.message || 'Unknown Gemini error'
+      message: (err && err.message) || 'Unknown Gemini error'
     });
   }
 });
 
-// ── AI CHAT ENDPOINT ─────────────────────────────────────────────
-// POST /api/chat
-// Body: { message: string, context: string, uid: string }
 app.post('/api/chat', async (req, res) => {
   const { message, context, uid } = req.body;
 
@@ -98,11 +91,11 @@ app.post('/api/chat', async (req, res) => {
       ? context
       : 'You are a warm, expert hair care assistant. Keep responses under 3 sentences.';
 
-  const fullPrompt = `${systemContext}\n\nUser: ${message.trim()}`;
+  const fullPrompt = systemContext + '\n\nUser: ' + message.trim();
 
   try {
     const result = await model.generateContent(fullPrompt);
-    const text = result?.response?.text?.();
+    const text = result && result.response ? result.response.text() : '';
 
     if (!text) {
       return res.status(500).json({ error: 'AI returned an empty response.' });
@@ -111,35 +104,33 @@ app.post('/api/chat', async (req, res) => {
     return res.json({ reply: text });
   } catch (err) {
     console.error('GEMINI FULL ERROR:', err);
-    console.error('GEMINI MESSAGE:', err?.message);
-    console.error('GEMINI STACK:', err?.stack);
+    console.error('GEMINI MESSAGE:', err && err.message);
+    console.error('GEMINI STACK:', err && err.stack);
 
-    if (err?.message?.includes('RESOURCE_EXHAUSTED') || err?.message?.toLowerCase().includes('quota')) {
+    if (err && err.message && (err.message.includes('RESOURCE_EXHAUSTED') || err.message.toLowerCase().includes('quota'))) {
       return res.status(429).json({ error: 'AI quota reached. Please try again tomorrow.' });
     }
 
-    if (err?.message?.includes('API_KEY_INVALID')) {
+    if (err && err.message && err.message.includes('API_KEY_INVALID')) {
       return res.status(401).json({ error: 'Invalid API key.' });
     }
 
     return res.status(500).json({
-      error: err?.message || 'AI is temporarily unavailable. Try again in a moment.'
+      error: (err && err.message) || 'AI is temporarily unavailable. Try again in a moment.'
     });
   }
 });
 
-// ── KEEP ALIVE ───────────────────────────────────────────────────
-const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || ('http://localhost:' + PORT);
 
-setInterval(() => {
+setInterval(function () {
   try {
     const client = SELF_URL.startsWith('https') ? https : http;
-    client.get(SELF_URL, () => {}).on('error', () => {});
-  } catch (_) {}
+    client.get(SELF_URL, function () {}).on('error', function () {});
+  } catch (e) {}
 }, 14 * 60 * 1000);
 
-// ── START ────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
-  console.log(`API key configured: ${process.env.GEMINI_API_KEY ? 'YES ✅' : 'NO ❌'}`);
+app.listen(PORT, function () {
+  console.log('Server running on port ' + PORT);
+  console.log('API key configured: ' + (process.env.GEMINI_API_KEY ? 'YES' : 'NO'));
 });

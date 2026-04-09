@@ -86,7 +86,9 @@ app.post('/api/chat', async (req, res) => {
     return res.json({ reply: text });
 
   } catch (err) {
-    console.error('Gemini error:', err.message);
+    console.error('Gemini full error:', err);
+console.error('Gemini message:', err?.message);
+console.error('Gemini stack:', err?.stack);
 
     if (err.message?.includes('RESOURCE_EXHAUSTED') || err.message?.includes('quota')) {
       return res.status(429).json({ error: 'AI quota reached. Please try again tomorrow.' });

@@ -35,7 +35,17 @@ if (!process.env.GEMINI_API_KEY) {
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
+// Primary model
 const model = genAI.getGenerativeModel({
+  model: 'gemini-2.5-flash-lite',
+  generationConfig: {
+    maxOutputTokens: 300,
+    temperature: 0.75
+  }
+});
+
+// Optional fallback model
+const fallbackModel = genAI.getGenerativeModel({
   model: 'gemini-2.5-flash',
   generationConfig: {
     maxOutputTokens: 300,
@@ -43,16 +53,59 @@ const model = genAI.getGenerativeModel({
   }
 });
 
-app.get('/', (req, res) => {
+function sleep(ms) {
+  return new Promise(function (resolve) {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function generateWithRetry(prompt, retries, delayMs) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      console.log('Gemini attempt:', attempt);
+
+      const result = await model.generateContent(prompt);
+      return result;
+    } catch (err) {
+      lastError = err;
+      const msg = (err && err.message ? err.message : '').toLowerCase();
+
+      const isRetryable =
+        msg.includes('503') ||
+        msg.includes('service unavailable') ||
+        msg.includes('high demand') ||
+        msg.includes('overloaded') ||
+        msg.includes('unavailable');
+
+      console.error('Primary model failed on attempt', attempt, '-', err && err.message);
+
+      if (!isRetryable) {
+        throw err;
+      }
+
+      if (attempt < retries) {
+        await sleep(delayMs * attempt);
+      }
+    }
+  }
+
+  console.log('Trying fallback model...');
+  const fallbackResult = await fallbackModel.generateContent(prompt);
+  return fallbackResult;
+}
+
+app.get('/', function (req, res) {
   res.json({
     status: 'ok',
     service: 'Hair Journal Tracker AI Backend'
   });
 });
 
-app.get('/test-gemini', async (req, res) => {
+app.get('/test-gemini', async function (req, res) {
   try {
-    const result = await model.generateContent('Say hello in one short sentence.');
+    const result = await generateWithRetry('Say hello in one short sentence.', 3, 2000);
     const reply = result && result.response ? result.response.text() : '';
 
     res.json({
@@ -71,8 +124,10 @@ app.get('/test-gemini', async (req, res) => {
   }
 });
 
-app.post('/api/chat', async (req, res) => {
-  const { message, context, uid } = req.body;
+app.post('/api/chat', async function (req, res) {
+  const message = req.body.message;
+  const context = req.body.context;
+  const uid = req.body.uid;
 
   if (!message || typeof message !== 'string' || message.trim().length === 0) {
     return res.status(400).json({ error: 'Message is required.' });
@@ -94,7 +149,7 @@ app.post('/api/chat', async (req, res) => {
   const fullPrompt = systemContext + '\n\nUser: ' + message.trim();
 
   try {
-    const result = await model.generateContent(fullPrompt);
+    const result = await generateWithRetry(fullPrompt, 3, 2000);
     const text = result && result.response ? result.response.text() : '';
 
     if (!text) {
@@ -107,16 +162,33 @@ app.post('/api/chat', async (req, res) => {
     console.error('GEMINI MESSAGE:', err && err.message);
     console.error('GEMINI STACK:', err && err.stack);
 
-    if (err && err.message && (err.message.includes('RESOURCE_EXHAUSTED') || err.message.toLowerCase().includes('quota'))) {
-      return res.status(429).json({ error: 'AI quota reached. Please try again tomorrow.' });
+    const errorMessage = err && err.message ? err.message.toLowerCase() : '';
+
+    if (errorMessage.includes('resource_exhausted') || errorMessage.includes('quota')) {
+      return res.status(429).json({
+        error: 'AI quota reached. Please try again tomorrow.'
+      });
     }
 
-    if (err && err.message && err.message.includes('API_KEY_INVALID')) {
-      return res.status(401).json({ error: 'Invalid API key.' });
+    if (errorMessage.includes('api_key_invalid')) {
+      return res.status(401).json({
+        error: 'Invalid API key.'
+      });
+    }
+
+    if (
+      errorMessage.includes('503') ||
+      errorMessage.includes('service unavailable') ||
+      errorMessage.includes('high demand') ||
+      errorMessage.includes('overloaded')
+    ) {
+      return res.status(503).json({
+        error: 'The AI is busy right now. Please try again in a few seconds.'
+      });
     }
 
     return res.status(500).json({
-      error: (err && err.message) || 'AI is temporarily unavailable. Try again in a moment.'
+      error: 'AI is temporarily unavailable. Try again in a moment.'
     });
   }
 });

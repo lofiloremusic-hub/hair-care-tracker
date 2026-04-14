@@ -27,11 +27,19 @@ app.use(cors({
 app.use(express.json({ limit: '15kb' }));
 
 if (!process.env.OPENAI_API_KEY) {
-  console.error('OPENAI_API_KEY is not set.');
+  console.error('API KEY is not set.');
   process.exit(1);
 }
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// 🔥 YAHAN CHANGE HUA HAI: OpenRouter ka Direct Connection
+const openai = new OpenAI({
+  baseURL: 'https://openrouter.ai/api/v1', // <-- OpenAI ki jagah OpenRouter ka URL
+  apiKey: process.env.OPENAI_API_KEY,      // <-- Render mein apni OpenRouter key hi rakhna
+  defaultHeaders: {
+    "HTTP-Referer": "https://jordyn-haircare.web.app", // OpenRouter ki security policy ke liye
+    "X-Title": "Jordyn Haircare"
+  }
+});
 
 app.post('/api/chat', async function (req, res) {
   const { message, context, uid, history = [] } = req.body;
@@ -49,17 +57,16 @@ app.post('/api/chat', async function (req, res) {
   messages.push({ role: 'user', content: message });
 
   try {
+    // 🔥 YAHAN CHANGE HUA HAI: Model update kiya
     const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: 'openrouter/free', // <-- Ye command automatically sabse best FREE model select kar legi!
       messages: messages,
-      max_tokens: 300,
-      temperature: 0.7
     });
 
     res.json({ reply: response.choices[0].message.content });
   } catch (err) {
     console.error('AI Error:', err.message);
-    res.status(500).json({ error: 'AI unavailable right now.' });
+    res.status(500).json({ error: 'AI unavailable right now. Try again.' });
   }
 });
 

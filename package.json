@@ -1,7 +1,7 @@
 {
   "name": "jordyn-haircare-backend",
   "version": "1.0.0",
-  "description": "Secure AI backend for Hair Journal Tracker",
+  "description": "Secure OpenAI backend for Jordyn's Hair Beauty",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -11,10 +11,10 @@
     "node": "18.x"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.21.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "openai": "^4.40.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"

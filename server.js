@@ -11,6 +11,7 @@ const PORT = process.env.PORT || 3000;
 const allowedOrigins = [
   'https://jordyn-haircare.web.app',
   'https://jordyn-haircare.firebaseapp.com',
+  'https://hair-care-tracker.web.app',
   'http://localhost:5000',
   'http://127.0.0.1:5500'
 ];

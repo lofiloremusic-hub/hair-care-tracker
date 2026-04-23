@@ -4,9 +4,6 @@ const cors = require('cors');
 const { OpenAI } = require('openai');
 const https = require('https');
 const http = require('http');
-const webpush = require('web-push');
-const admin = require('firebase-admin');
-const { DateTime } = require('luxon');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -20,7 +17,7 @@ const allowedOrigins = [
 ];
 
 app.use(cors({
-  origin: function(origin, callback) {
+  origin: function (origin, callback) {
     if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
     return callback(new Error('Not allowed by CORS'));
   },
@@ -28,234 +25,45 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-app.use(express.json({ limit: '40kb' }));
+app.use(express.json({ limit: '15kb' }));
 
 if (!process.env.OPENAI_API_KEY) {
-  console.error('OPENAI_API_KEY is not set.');
+  console.error('API KEY is not set.');
   process.exit(1);
 }
 
-if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY || !process.env.VAPID_SUBJECT) {
-  console.error('VAPID keys are not set.');
-  process.exit(1);
-}
-
-if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-  console.error('FIREBASE_SERVICE_ACCOUNT_JSON is not set.');
-  process.exit(1);
-}
-
-webpush.setVapidDetails(
-  process.env.VAPID_SUBJECT,
-  process.env.VAPID_PUBLIC_KEY,
-  process.env.VAPID_PRIVATE_KEY
-);
-
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
-
-const db = admin.firestore();
-const FieldValue = admin.firestore.FieldValue;
-
+// 🔥 YAHAN CHANGE HUA HAI: OpenRouter ka Direct Connection
 const openai = new OpenAI({
-  baseURL: 'https://openrouter.ai/api/v1',
-  apiKey: process.env.OPENAI_API_KEY,
+  baseURL: 'https://openrouter.ai/api/v1', // <-- OpenAI ki jagah OpenRouter ka URL
+  apiKey: process.env.OPENAI_API_KEY,      // <-- Render mein apni OpenRouter key hi rakhna
   defaultHeaders: {
-    'HTTP-Referer': 'https://jordyn-haircare.web.app',
-    'X-Title': 'Jordyn Haircare'
+    "HTTP-Referer": "https://jordyn-haircare.web.app", // OpenRouter ki security policy ke liye
+    "X-Title": "Jordyn Haircare"
   }
 });
 
-const SMART_NOTIFICATION_SLOTS = [
-  { key: 'morning', hour: 10, minute: 0 },
-  { key: 'afternoon', hour: 15, minute: 0 },
-  { key: 'evening', hour: 17, minute: 0 }
-];
+app.post('/api/chat', async function (req, res) {
+  const { message, context, uid, history = [] } = req.body;
 
-const REMINDER_TYPE_EMOJI = {
-  wash: '🧼',
-  condition: '💆',
-  oil: '🌿',
-  trim: '✂️',
-  protective: '🌸',
-  hydrate: '💧',
-  custom: '🔔'
-};
-
-function cleanSubscription(subscription) {
-  if (!subscription || !subscription.endpoint || !subscription.keys) return null;
-  return {
-    endpoint: subscription.endpoint,
-    expirationTime: subscription.expirationTime || null,
-    keys: {
-      p256dh: subscription.keys.p256dh,
-      auth: subscription.keys.auth
-    }
-  };
-}
-
-function getTodayKey(zone) {
-  return DateTime.now().setZone(zone || 'UTC').toFormat('yyyy-LL-dd');
-}
-
-function getNotificationName(userDoc, userData) {
-  const name = ((userData && userData.profile && userData.profile.name) || userDoc.displayName || 'love').trim();
-  return name.split(' ')[0] || 'love';
-}
-
-function getReminderIntervalDays(freq) {
-  if (freq === 'daily') return 1;
-  if (freq === 'every3days') return 3;
-  if (freq === 'every5days') return 5;
-  if (freq === 'weekly') return 7;
-  if (freq === 'biweekly') return 14;
-  if (freq === 'monthly') return 30;
-  if (freq === 'quarterly') return 90;
-  return 0;
-}
-
-function isReminderDueToday(reminder, localNow) {
-  const interval = getReminderIntervalDays(reminder.frequency);
-  if (!interval) return false;
-  const todayStart = localNow.startOf('day');
-  const base = reminder.ts ? DateTime.fromMillis(reminder.ts).setZone(localNow.zoneName) : todayStart;
-  const baseStart = base.startOf('day');
-  const daysSince = Math.floor(todayStart.diff(baseStart, 'days').days);
-  return daysSince >= 0 && daysSince % interval === 0;
-}
-
-function buildReminderNotification(reminder, userDoc, userData) {
-  const name = getNotificationName(userDoc, userData);
-  const emoji = REMINDER_TYPE_EMOJI[reminder.type] || '🔔';
-  return {
-    title: `${emoji} ${reminder.title} for ${name}`,
-    body: 'Your scheduled hair reminder is ready. Tap to open Jordyn and stay consistent.',
-    tag: `jhb-rem-${reminder.id}`,
-    data: { page: 'Calendar', url: '/#open-page=Calendar', reminderId: reminder.id }
-  };
-}
-
-function buildSmartNotification(slotKey, userDoc, userData) {
-  const name = getNotificationName(userDoc, userData);
-  const profile = (userData && userData.profile) || {};
-  const goal = profile.hairGoal || 'healthier hair';
-  if (slotKey === 'morning') {
-    return {
-      title: `✨ Morning hair note for ${name}`,
-      body: `Start the day with a small step toward ${goal.toLowerCase()}. Keep moisture in early and protect your ends.`,
-      tag: 'jhb-morning',
-      data: { page: 'Home', url: '/#open-page=Home' }
-    };
-  }
-  if (slotKey === 'afternoon') {
-    return {
-      title: `💡 Midday hair tip for ${name}`,
-      body: 'Quick reset: smooth dry areas, keep styling low-tension, and avoid over-touching your hair this afternoon.',
-      tag: 'jhb-afternoon',
-      data: { page: 'Home', url: '/#open-page=Home' }
-    };
-  }
-  return {
-    title: `🌙 Evening routine reminder for ${name}`,
-    body: 'Protect your progress tonight with one calm hair-care step before the day ends.',
-    tag: 'jhb-evening',
-    data: { page: 'Calendar', url: '/#open-page=Calendar' }
-  };
-}
-
-async function sendToSubscriptions(subscriptions, payload) {
-  const alive = [];
-  for (const sub of subscriptions || []) {
-    try {
-      await webpush.sendNotification(sub, JSON.stringify(payload));
-      alive.push(sub);
-    } catch (err) {
-      const code = err && err.statusCode;
-      if (code !== 404 && code !== 410) alive.push(sub);
-    }
-  }
-  return alive;
-}
-
-function uniqueByEndpoint(list) {
-  const seen = new Set();
-  return (list || []).filter((sub) => {
-    if (!sub || !sub.endpoint || seen.has(sub.endpoint)) return false;
-    seen.add(sub.endpoint);
-    return true;
-  });
-}
-
-app.get('/', function(req, res) {
-  res.send('Jordyn Haircare push server is running');
-});
-
-app.get('/health', function(req, res) {
-  res.json({ ok: true });
-});
-
-app.get('/api/push/public-key', function(req, res) {
-  res.json({ publicKey: process.env.VAPID_PUBLIC_KEY });
-});
-
-app.post('/api/push/subscribe', async function(req, res) {
-  const { uid, email, displayName, timezone, notificationsEnabled, subscription } = req.body || {};
-  if (!uid) return res.status(400).json({ error: 'Missing uid' });
-
-  const cleaned = cleanSubscription(subscription);
-  const userRef = db.collection('users').doc(uid);
-  const snap = await userRef.get();
-  const existing = snap.exists ? (snap.data() || {}) : {};
-  const subscriptions = uniqueByEndpoint([].concat(existing.pushSubscriptions || [], cleaned || []).filter(Boolean));
-
-  await userRef.set({
-    uid,
-    email: email || existing.email || '',
-    displayName: displayName || existing.displayName || '',
-    timezone: timezone || existing.timezone || 'UTC',
-    notificationsEnabled: notificationsEnabled !== false,
-    pushSubscriptions: subscriptions,
-    updatedAt: FieldValue.serverTimestamp()
-  }, { merge: true });
-
-  res.json({ ok: true, count: subscriptions.length });
-});
-
-app.post('/api/push/unsubscribe', async function(req, res) {
-  const { uid, endpoint, notificationsEnabled } = req.body || {};
-  if (!uid) return res.status(400).json({ error: 'Missing uid' });
-
-  const userRef = db.collection('users').doc(uid);
-  const snap = await userRef.get();
-  const existing = snap.exists ? (snap.data() || {}) : {};
-  const subscriptions = (existing.pushSubscriptions || []).filter((sub) => sub && sub.endpoint !== endpoint);
-
-  await userRef.set({
-    notificationsEnabled: !!notificationsEnabled,
-    pushSubscriptions: subscriptions,
-    updatedAt: FieldValue.serverTimestamp()
-  }, { merge: true });
-
-  res.json({ ok: true });
-});
-
-app.post('/api/chat', async function(req, res) {
-  const { message, context, uid, history = [], tier = 'standard' } = req.body || {};
   if (!message || !uid) return res.status(400).json({ error: 'Missing data' });
 
-  const messages = [{ role: 'system', content: context || 'You are a warm hair care expert.' }];
-  history.forEach((m) => {
+  const messages = [
+    { role: 'system', content: context || 'You are a warm hair care expert.' }
+  ];
+  
+  history.forEach(m => {
     messages.push({ role: m.role === 'ai' ? 'assistant' : 'user', content: m.text });
   });
+  
   messages.push({ role: 'user', content: message });
 
   try {
+    // 🔥 YAHAN CHANGE HUA HAI: Model update kiya
     const response = await openai.chat.completions.create({
-      model: tier === 'advanced' ? 'openrouter/auto' : 'openrouter/free',
-      messages
+      model: 'openrouter/free', // <-- Ye command automatically sabse best FREE model select kar legi!
+      messages: messages,
     });
+
     res.json({ reply: response.choices[0].message.content });
   } catch (err) {
     console.error('AI Error:', err.message);
@@ -263,102 +71,11 @@ app.post('/api/chat', async function(req, res) {
   }
 });
 
-async function processScheduledNotifications() {
-  const usersSnap = await db.collection('users').where('notificationsEnabled', '==', true).get();
-  const nowUtc = DateTime.utc();
-
-  for (const userDocSnap of usersSnap.docs) {
-    const userDoc = userDocSnap.data() || {};
-    const uid = userDoc.uid || userDocSnap.id;
-    const subscriptions = uniqueByEndpoint(userDoc.pushSubscriptions || []);
-    if (!subscriptions.length) continue;
-
-    const requestedZone = userDoc.timezone || 'UTC';
-    const zone = DateTime.now().setZone(requestedZone).isValid ? requestedZone : 'UTC';
-    const localNow = nowUtc.setZone(zone);
-    const minuteKey = localNow.toFormat('HH:mm');
-    const todayKey = localNow.toFormat('yyyy-LL-dd');
-
-    const userDataSnap = await db.collection('userData').doc(uid).get();
-    const userData = userDataSnap.exists ? (userDataSnap.data() || {}) : {};
-    const notificationMeta = Object.assign({}, userDoc.notificationMeta || {});
-
-    for (const slot of SMART_NOTIFICATION_SLOTS) {
-      const slotKey = `${String(slot.hour).padStart(2, '0')}:${String(slot.minute).padStart(2, '0')}`;
-      const logKey = `${todayKey}:${slot.key}`;
-      if (minuteKey === slotKey && !notificationMeta[logKey]) {
-        const payload = buildSmartNotification(slot.key, userDoc, userData);
-        const alive = await sendToSubscriptions(subscriptions, payload);
-        notificationMeta[logKey] = Date.now();
-        await userDocSnap.ref.set({
-          pushSubscriptions: alive,
-          notificationMeta,
-          updatedAt: FieldValue.serverTimestamp()
-        }, { merge: true });
-      }
-    }
-
-    const reminders = (userData.reminders || []).filter((item) => item && item.enabled !== false);
-    for (const reminder of reminders) {
-      if (!isReminderDueToday(reminder, localNow)) continue;
-      const reminderTime = String(reminder.time || '08:00').slice(0, 5);
-      const logKey = `${todayKey}:rem:${reminder.id}`;
-      if (minuteKey !== reminderTime || notificationMeta[logKey]) continue;
-
-      const payload = buildReminderNotification(reminder, userDoc, userData);
-      const alive = await sendToSubscriptions(subscriptions, payload);
-      notificationMeta[logKey] = Date.now();
-      await userDocSnap.ref.set({
-        pushSubscriptions: alive,
-        notificationMeta,
-        updatedAt: FieldValue.serverTimestamp()
-      }, { merge: true });
-    }
-  }
-}
-
-async function processBroadcasts() {
-  const broadcastSnap = await db.collection('broadcasts').doc('global').get();
-  if (!broadcastSnap.exists) return;
-
-  const broadcast = broadcastSnap.data() || {};
-  if (!broadcast.id || !broadcast.body) return;
-
-  const usersSnap = await db.collection('users').where('notificationsEnabled', '==', true).get();
-  for (const userDocSnap of usersSnap.docs) {
-    const userDoc = userDocSnap.data() || {};
-    const subscriptions = uniqueByEndpoint(userDoc.pushSubscriptions || []);
-    if (!subscriptions.length) continue;
-    if (userDoc.lastBroadcastPushId === broadcast.id) continue;
-
-    const payload = {
-      title: '📣 Jordyn update',
-      body: String(broadcast.body).slice(0, 100),
-      tag: 'jhb-broadcast',
-      data: { page: 'Home', url: '/#open-page=Home' }
-    };
-
-    const alive = await sendToSubscriptions(subscriptions, payload);
-    await userDocSnap.ref.set({
-      pushSubscriptions: alive,
-      lastBroadcastPushId: broadcast.id,
-      updatedAt: FieldValue.serverTimestamp()
-    }, { merge: true });
-  }
-}
-
+// Keep-alive for Render
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || ('http://localhost:' + PORT);
 setInterval(() => {
-  processScheduledNotifications().catch((err) => console.error('scheduled notification error', err.message));
-}, 60000);
-
-setInterval(() => {
-  processBroadcasts().catch((err) => console.error('broadcast push error', err.message));
-}, 30000);
-
-const SELF_PING_URL = (process.env.RENDER_EXTERNAL_URL || ('http://localhost:' + PORT)).replace(/\/+$/, '') + '/health';
-setInterval(() => {
-  const client = SELF_PING_URL.startsWith('https') ? https : http;
-  client.get(SELF_PING_URL, () => {}).on('error', () => {});
+  const client = SELF_URL.startsWith('https') ? https : http;
+  client.get(SELF_URL, () => {}).on('error', () => {});
 }, 14 * 60 * 1000);
 
 app.listen(PORT, () => console.log('Server running on ' + PORT));

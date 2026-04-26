@@ -74,6 +74,16 @@ const SMART_NOTIFICATION_SLOTS = [
   { key: 'evening', hour: 17, minute: 0 }
 ];
 
+const AI_LIMITS = {
+  advancedPerDay: 30,
+  freePerMonth: 30
+};
+
+const MAX_AI_HISTORY_ITEMS = 12;
+const SCHEDULE_CATCHUP_MINUTES = Math.max(5, parseInt(process.env.SCHEDULE_CATCHUP_MINUTES || '12', 10) || 12);
+
+let lastScheduleSweepAt = 0;
+
 const REMINDER_TYPE_EMOJI = {
   wash: '🧼',
   condition: '💆',
@@ -188,6 +198,149 @@ function uniqueByEndpoint(list) {
   });
 }
 
+function jsonError(res, status, code, message, extra) {
+  return res.status(status).json(Object.assign({
+    code,
+    error: message || code
+  }, extra || {}));
+}
+
+function getValidTimezone(requestedZone) {
+  const zone = requestedZone || 'UTC';
+  return DateTime.now().setZone(zone).isValid ? zone : 'UTC';
+}
+
+async function requireFirebaseAuth(req, res) {
+  const header = String(req.headers.authorization || '');
+  if (!header.startsWith('Bearer ')) {
+    jsonError(res, 401, 'auth_required', 'Missing session token.');
+    return null;
+  }
+
+  const token = header.slice(7).trim();
+  if (!token) {
+    jsonError(res, 401, 'auth_required', 'Missing session token.');
+    return null;
+  }
+
+  try {
+    return await admin.auth().verifyIdToken(token);
+  } catch (err) {
+    console.error('Auth verification failed:', err.message);
+    jsonError(res, 401, 'auth_invalid', 'Your session expired. Please sign in again.');
+    return null;
+  }
+}
+
+function sanitizeMessageText(value, maxLength) {
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
+}
+
+function sanitizeAIHistory(history) {
+  if (!Array.isArray(history)) return [];
+  return history.slice(-MAX_AI_HISTORY_ITEMS).map((item) => ({
+    role: item && item.role === 'ai' ? 'assistant' : 'user',
+    content: sanitizeMessageText(item && item.text, 1200)
+  })).filter((item) => item.content);
+}
+
+function pruneKeyedLog(log, keepKey) {
+  const next = {};
+  const used = parseInt((log || {})[keepKey] || 0, 10) || 0;
+  next[keepKey] = used;
+  return next;
+}
+
+function getServerAIQuotaState(userDoc, nowUtc) {
+  const zone = getValidTimezone(userDoc.timezone);
+  const localNow = nowUtc.setZone(zone);
+  const isAdvanced = !!(userDoc.isAdmin || userDoc.isPremium);
+  return {
+    isAdvanced,
+    limit: isAdvanced ? AI_LIMITS.advancedPerDay : AI_LIMITS.freePerMonth,
+    periodKey: isAdvanced ? localNow.toFormat('yyyy-LL-dd') : localNow.toFormat('yyyy-LL')
+  };
+}
+
+function formatQuotaResponse(quota) {
+  return {
+    limit: quota.limit,
+    used: quota.used,
+    remaining: quota.remaining,
+    periodKey: quota.periodKey,
+    mode: quota.isAdvanced ? 'advanced' : 'standard'
+  };
+}
+
+async function consumeServerAIQuota(userRef, nowUtc) {
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+    const userDoc = snap.exists ? (snap.data() || {}) : {};
+    const quota = getServerAIQuotaState(userDoc, nowUtc);
+    const log = pruneKeyedLog(userDoc.aiUsageLog || {}, quota.periodKey);
+    const used = parseInt(log[quota.periodKey] || 0, 10) || 0;
+
+    if (used >= quota.limit) {
+      return Object.assign({ allowed: false, used, remaining: 0 }, quota, { userDoc });
+    }
+
+    log[quota.periodKey] = used + 1;
+    tx.set(userRef, {
+      aiUsageLog: log,
+      updatedAt: FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    return Object.assign({ allowed: true, used: used + 1, remaining: quota.limit - (used + 1) }, quota, { userDoc });
+  });
+}
+
+function getCatchupWindowStart(nowUtc, lastRunAt) {
+  if (!lastRunAt) return nowUtc.minus({ minutes: SCHEDULE_CATCHUP_MINUTES });
+  const previous = DateTime.fromMillis(lastRunAt).toUTC();
+  if (!previous.isValid) return nowUtc.minus({ minutes: SCHEDULE_CATCHUP_MINUTES });
+  const floor = nowUtc.minus({ minutes: SCHEDULE_CATCHUP_MINUTES });
+  return previous < floor ? floor : previous.minus({ seconds: 2 });
+}
+
+function getCandidateLocalDays(windowStartLocal, windowEndLocal) {
+  const keys = new Set();
+  const days = [];
+
+  [windowStartLocal.startOf('day'), windowEndLocal.startOf('day')].forEach((day) => {
+    const key = day.toFormat('yyyy-LL-dd');
+    if (!keys.has(key)) {
+      keys.add(key);
+      days.push(day);
+    }
+  });
+
+  return days;
+}
+
+function findDueLocalMomentForClock(hour, minute, windowStartLocal, windowEndLocal) {
+  const candidateDays = getCandidateLocalDays(windowStartLocal, windowEndLocal);
+  for (const day of candidateDays) {
+    const target = day.set({ hour, minute, second: 0, millisecond: 0 });
+    if (target >= windowStartLocal && target <= windowEndLocal) return target;
+  }
+  return null;
+}
+
+function findDueReminderMoment(reminder, windowStartLocal, windowEndLocal) {
+  const hm = String(reminder.time || '08:00').slice(0, 5).split(':');
+  const hour = parseInt(hm[0], 10) || 0;
+  const minute = parseInt(hm[1], 10) || 0;
+  const candidateDays = getCandidateLocalDays(windowStartLocal, windowEndLocal);
+
+  for (const day of candidateDays) {
+    const target = day.set({ hour, minute, second: 0, millisecond: 0 });
+    if (target < windowStartLocal || target > windowEndLocal) continue;
+    if (isReminderDueToday(reminder, target)) return target;
+  }
+
+  return null;
+}
+
 app.get('/', function(req, res) {
   res.send('Jordyn Haircare push server is running');
 });
@@ -201,10 +354,14 @@ app.get('/api/push/public-key', function(req, res) {
 });
 
 app.post('/api/push/subscribe', async function(req, res) {
-  const { uid, email, displayName, timezone, notificationsEnabled, subscription } = req.body || {};
-  if (!uid) return res.status(400).json({ error: 'Missing uid' });
+  const auth = await requireFirebaseAuth(req, res);
+  if (!auth) return;
+
+  const { email, displayName, timezone, notificationsEnabled, subscription } = req.body || {};
+  const uid = auth.uid;
 
   const cleaned = cleanSubscription(subscription);
+  if (!cleaned) return jsonError(res, 400, 'invalid_subscription', 'Missing or invalid push subscription.');
   const userRef = db.collection('users').doc(uid);
   const snap = await userRef.get();
   const existing = snap.exists ? (snap.data() || {}) : {};
@@ -212,9 +369,9 @@ app.post('/api/push/subscribe', async function(req, res) {
 
   await userRef.set({
     uid,
-    email: email || existing.email || '',
-    displayName: displayName || existing.displayName || '',
-    timezone: timezone || existing.timezone || 'UTC',
+    email: auth.email || email || existing.email || '',
+    displayName: auth.name || displayName || existing.displayName || '',
+    timezone: getValidTimezone(timezone || existing.timezone),
     notificationsEnabled: notificationsEnabled !== false,
     pushSubscriptions: subscriptions,
     updatedAt: FieldValue.serverTimestamp()
@@ -224,8 +381,12 @@ app.post('/api/push/subscribe', async function(req, res) {
 });
 
 app.post('/api/push/unsubscribe', async function(req, res) {
-  const { uid, endpoint, notificationsEnabled } = req.body || {};
-  if (!uid) return res.status(400).json({ error: 'Missing uid' });
+  const auth = await requireFirebaseAuth(req, res);
+  if (!auth) return;
+
+  const { endpoint, notificationsEnabled } = req.body || {};
+  if (!endpoint) return jsonError(res, 400, 'missing_endpoint', 'Missing push endpoint.');
+  const uid = auth.uid;
 
   const userRef = db.collection('users').doc(uid);
   const snap = await userRef.get();
@@ -242,74 +403,103 @@ app.post('/api/push/unsubscribe', async function(req, res) {
 });
 
 app.post('/api/chat', async function(req, res) {
-  const { message, context, uid, history = [], tier = 'standard' } = req.body || {};
-  if (!message || !uid) return res.status(400).json({ error: 'Missing data' });
+  const auth = await requireFirebaseAuth(req, res);
+  if (!auth) return;
 
-  const messages = [{ role: 'system', content: context || 'You are a warm hair care expert.' }];
-  history.forEach((m) => {
-    messages.push({ role: m.role === 'ai' ? 'assistant' : 'user', content: m.text });
+  const { message, context, history = [], tier = 'standard' } = req.body || {};
+  const safeMessage = sanitizeMessageText(message, 2400);
+  if (!safeMessage) return jsonError(res, 400, 'missing_data', 'Missing message.');
+
+  const userRef = db.collection('users').doc(auth.uid);
+  const quota = await consumeServerAIQuota(userRef, DateTime.utc());
+  const userDoc = quota.userDoc || {};
+
+  if (tier === 'advanced' && !quota.isAdvanced) {
+    return jsonError(res, 403, 'advanced_ai_locked', 'Advanced AI is only available for Premium/Admin.', {
+      quota: formatQuotaResponse(quota)
+    });
+  }
+
+  if (!quota.allowed) {
+    return jsonError(res, 429, 'quota_exceeded', quota.isAdvanced
+      ? 'You have used all 30 Advanced AI messages for today.'
+      : 'You have used all 30 free AI messages for this month.', {
+      quota: formatQuotaResponse(quota)
+    });
+  }
+
+  const messages = [{ role: 'system', content: sanitizeMessageText(context || 'You are a warm hair care expert.', 4000) }];
+  sanitizeAIHistory(history).forEach((m) => {
+    messages.push(m);
   });
-  messages.push({ role: 'user', content: message });
+  messages.push({ role: 'user', content: safeMessage });
 
   try {
     const response = await openai.chat.completions.create({
-      model: tier === 'advanced' ? 'openrouter/auto' : 'openrouter/free',
+      model: quota.isAdvanced ? 'openrouter/auto' : 'openrouter/free',
       messages
     });
-    res.json({ reply: response.choices[0].message.content });
+    res.json({
+      reply: response.choices[0].message.content,
+      quota: formatQuotaResponse(quota),
+      tier: quota.isAdvanced ? 'advanced' : 'standard',
+      uid: auth.uid,
+      plan: userDoc.isAdmin ? 'admin' : userDoc.isPremium ? 'premium' : 'free'
+    });
   } catch (err) {
     console.error('AI Error:', err.message);
-    res.status(500).json({ error: 'AI unavailable right now. Try again.' });
+    res.status(500).json({ code: 'ai_unavailable', error: 'AI unavailable right now. Try again.' });
   }
 });
 
 async function processScheduledNotifications() {
   const usersSnap = await db.collection('users').where('notificationsEnabled', '==', true).get();
   const nowUtc = DateTime.utc();
+  const windowStartUtc = getCatchupWindowStart(nowUtc, lastScheduleSweepAt);
+  lastScheduleSweepAt = nowUtc.toMillis();
 
   for (const userDocSnap of usersSnap.docs) {
     const userDoc = userDocSnap.data() || {};
     const uid = userDoc.uid || userDocSnap.id;
-    const subscriptions = uniqueByEndpoint(userDoc.pushSubscriptions || []);
+    let subscriptions = uniqueByEndpoint(userDoc.pushSubscriptions || []);
     if (!subscriptions.length) continue;
 
-    const requestedZone = userDoc.timezone || 'UTC';
-    const zone = DateTime.now().setZone(requestedZone).isValid ? requestedZone : 'UTC';
+    const zone = getValidTimezone(userDoc.timezone);
     const localNow = nowUtc.setZone(zone);
-    const minuteKey = localNow.toFormat('HH:mm');
-    const todayKey = localNow.toFormat('yyyy-LL-dd');
+    const localWindowStart = windowStartUtc.setZone(zone);
 
     const userDataSnap = await db.collection('userData').doc(uid).get();
     const userData = userDataSnap.exists ? (userDataSnap.data() || {}) : {};
     const notificationMeta = Object.assign({}, userDoc.notificationMeta || {});
 
     for (const slot of SMART_NOTIFICATION_SLOTS) {
-      const slotKey = `${String(slot.hour).padStart(2, '0')}:${String(slot.minute).padStart(2, '0')}`;
-      const logKey = `${todayKey}:${slot.key}`;
-      if (minuteKey === slotKey && !notificationMeta[logKey]) {
-        const payload = buildSmartNotification(slot.key, userDoc, userData);
-        const alive = await sendToSubscriptions(subscriptions, payload);
-        notificationMeta[logKey] = Date.now();
-        await userDocSnap.ref.set({
-          pushSubscriptions: alive,
-          notificationMeta,
-          updatedAt: FieldValue.serverTimestamp()
-        }, { merge: true });
-      }
+      const dueMoment = findDueLocalMomentForClock(slot.hour, slot.minute, localWindowStart, localNow);
+      if (!dueMoment) continue;
+      const logKey = `${dueMoment.toFormat('yyyy-LL-dd')}:${slot.key}`;
+      if (notificationMeta[logKey]) continue;
+
+      const payload = buildSmartNotification(slot.key, userDoc, userData);
+      subscriptions = await sendToSubscriptions(subscriptions, payload);
+      notificationMeta[logKey] = Date.now();
+      await userDocSnap.ref.set({
+        pushSubscriptions: subscriptions,
+        notificationMeta,
+        updatedAt: FieldValue.serverTimestamp()
+      }, { merge: true });
     }
 
     const reminders = (userData.reminders || []).filter((item) => item && item.enabled !== false);
     for (const reminder of reminders) {
-      if (!isReminderDueToday(reminder, localNow)) continue;
-      const reminderTime = String(reminder.time || '08:00').slice(0, 5);
-      const logKey = `${todayKey}:rem:${reminder.id}`;
-      if (minuteKey !== reminderTime || notificationMeta[logKey]) continue;
+      const dueMoment = findDueReminderMoment(reminder, localWindowStart, localNow);
+      if (!dueMoment) continue;
+      const logKey = `${dueMoment.toFormat('yyyy-LL-dd')}:rem:${reminder.id}`;
+      if (notificationMeta[logKey]) continue;
 
       const payload = buildReminderNotification(reminder, userDoc, userData);
-      const alive = await sendToSubscriptions(subscriptions, payload);
+      subscriptions = await sendToSubscriptions(subscriptions, payload);
       notificationMeta[logKey] = Date.now();
       await userDocSnap.ref.set({
-        pushSubscriptions: alive,
+        pushSubscriptions: subscriptions,
         notificationMeta,
         updatedAt: FieldValue.serverTimestamp()
       }, { merge: true });
@@ -334,8 +524,8 @@ async function processBroadcasts() {
     const payload = {
       title: '📣 Jordyn update',
       body: String(broadcast.body).slice(0, 100),
-      tag: 'jhb-broadcast',
-      data: { page: 'Home', url: '/#open-page=Home' }
+      tag: `jhb-broadcast-${broadcast.id}`,
+      data: { page: 'Home', url: '/#open-page=Home', broadcastId: broadcast.id }
     };
 
     const alive = await sendToSubscriptions(subscriptions, payload);

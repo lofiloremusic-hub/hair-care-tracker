@@ -87,6 +87,7 @@ let lastScheduleSweepAt = 0;
 const REMINDER_TYPE_EMOJI = {
   wash: '🧼',
   condition: '💆',
+  protein: '💪',
   oil: '🌿',
   trim: '✂️',
   protective: '🌸',
@@ -116,6 +117,7 @@ function getNotificationName(userDoc, userData) {
 }
 
 function getReminderIntervalDays(freq) {
+  if (freq === 'once') return 0;
   if (freq === 'daily') return 1;
   if (freq === 'every3days') return 3;
   if (freq === 'every5days') return 5;
@@ -126,12 +128,34 @@ function getReminderIntervalDays(freq) {
   return 0;
 }
 
+function getReminderBaseDate(reminder, localNow) {
+  const ds = reminder.date || reminder.startDate;
+  if (ds) {
+    const parsed = DateTime.fromISO(String(ds), { zone: localNow.zoneName });
+    if (parsed.isValid) return parsed;
+  }
+  if (reminder.ts) return DateTime.fromMillis(reminder.ts).setZone(localNow.zoneName);
+  return localNow.startOf('day');
+}
+
 function isReminderDueToday(reminder, localNow) {
-  const interval = getReminderIntervalDays(reminder.frequency);
-  if (!interval) return false;
+  const freq = reminder.frequency || 'once';
   const todayStart = localNow.startOf('day');
-  const base = reminder.ts ? DateTime.fromMillis(reminder.ts).setZone(localNow.zoneName) : todayStart;
+  const base = getReminderBaseDate(reminder, localNow);
   const baseStart = base.startOf('day');
+
+  if ((reminder.frequency || 'once') === 'once') {
+    return baseStart.toFormat('yyyy-LL-dd') === todayStart.toFormat('yyyy-LL-dd');
+  }
+
+  if (freq === 'monthly' || freq === 'quarterly') {
+    const monthsSince = (todayStart.year - baseStart.year) * 12 + (todayStart.month - baseStart.month);
+    if (monthsSince < 0 || todayStart.day !== baseStart.day) return false;
+    return freq === 'monthly' ? true : monthsSince % 3 === 0;
+  }
+
+  const interval = getReminderIntervalDays(freq);
+  if (!interval) return false;
   const daysSince = Math.floor(todayStart.diff(baseStart, 'days').days);
   return daysSince >= 0 && daysSince % interval === 0;
 }
@@ -551,4 +575,8 @@ setInterval(() => {
   client.get(SELF_PING_URL, () => {}).on('error', () => {});
 }, 14 * 60 * 1000);
 
-app.listen(PORT, () => console.log('Server running on ' + PORT));
+app.listen(PORT, () => {
+  console.log('Server running on ' + PORT);
+  processScheduledNotifications().catch((err) => console.error('scheduled notification startup error', err.message));
+  processBroadcasts().catch((err) => console.error('broadcast startup error', err.message));
+});

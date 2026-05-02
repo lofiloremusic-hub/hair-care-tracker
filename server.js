@@ -234,6 +234,29 @@ function getValidTimezone(requestedZone) {
   return DateTime.now().setZone(zone).isValid ? zone : 'UTC';
 }
 
+async function mirrorNotificationPreferenceToUserData(uid, enabled, timezone) {
+  const profilePatch = {
+    notifications: !!enabled,
+    pushLinked: !!enabled,
+    timezone: getValidTimezone(timezone)
+  };
+  if (enabled) profilePatch.notificationPermission = 'granted';
+
+  try {
+    await db.collection('userData').doc(uid).set({
+      profile: profilePatch,
+      syncMeta: {
+        collections: {
+          profile: Date.now()
+        }
+      },
+      updatedAt: FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (err) {
+    console.warn('Could not mirror notification preference to userData:', err.message);
+  }
+}
+
 async function requireFirebaseAuth(req, res) {
   const header = String(req.headers.authorization || '');
   if (!header.startsWith('Bearer ')) {
@@ -401,6 +424,8 @@ app.post('/api/push/subscribe', async function(req, res) {
     updatedAt: FieldValue.serverTimestamp()
   }, { merge: true });
 
+  await mirrorNotificationPreferenceToUserData(uid, notificationsEnabled !== false, timezone || existing.timezone);
+
   res.json({ ok: true, count: subscriptions.length });
 });
 
@@ -422,6 +447,10 @@ app.post('/api/push/unsubscribe', async function(req, res) {
     pushSubscriptions: subscriptions,
     updatedAt: FieldValue.serverTimestamp()
   }, { merge: true });
+
+  if (!notificationsEnabled) {
+    await mirrorNotificationPreferenceToUserData(uid, false, existing.timezone);
+  }
 
   res.json({ ok: true });
 });
@@ -580,3 +609,4 @@ app.listen(PORT, () => {
   processScheduledNotifications().catch((err) => console.error('scheduled notification startup error', err.message));
   processBroadcasts().catch((err) => console.error('broadcast startup error', err.message));
 });
+

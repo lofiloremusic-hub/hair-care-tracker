@@ -1,3 +1,4 @@
+
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -58,6 +59,7 @@ admin.initializeApp({
 
 const db = admin.firestore();
 const FieldValue = admin.firestore.FieldValue;
+const FieldPath = admin.firestore.FieldPath;
 
 const openai = new OpenAI({
   baseURL: 'https://openrouter.ai/api/v1',
@@ -80,9 +82,16 @@ const AI_LIMITS = {
 };
 
 const MAX_AI_HISTORY_ITEMS = 12;
-const SCHEDULE_CATCHUP_MINUTES = Math.max(5, parseInt(process.env.SCHEDULE_CATCHUP_MINUTES || '12', 10) || 12);
+const SCHEDULE_CATCHUP_MINUTES = Math.max(12, parseInt(process.env.SCHEDULE_CATCHUP_MINUTES || '24', 10) || 24);
+const SCHEDULE_SWEEP_LIMIT = Math.max(50, Math.min(500, parseInt(process.env.SCHEDULE_SWEEP_LIMIT || '250', 10) || 250));
+const BROADCAST_BATCH_SIZE = Math.max(10, Math.min(100, parseInt(process.env.BROADCAST_BATCH_SIZE || '40', 10) || 40));
+const ADMIN_EMAILS = new Set(['iamkaransingh0709@gmail.com', 'jordynjada03@gmail.com']);
 
 let lastScheduleSweepAt = 0;
+let scheduleCursorId = '';
+let scheduleRunning = false;
+let broadcastRunning = false;
+let lastBroadcastProcessedId = '';
 
 const REMINDER_TYPE_EMOJI = {
   wash: '🧼',
@@ -279,6 +288,25 @@ async function requireFirebaseAuth(req, res) {
   }
 }
 
+async function requireAdminAuth(req, res) {
+  const auth = await requireFirebaseAuth(req, res);
+  if (!auth) return null;
+
+  const email = String(auth.email || '').toLowerCase();
+  if (ADMIN_EMAILS.has(email)) return auth;
+
+  try {
+    const snap = await db.collection('users').doc(auth.uid).get();
+    const userDoc = snap.exists ? (snap.data() || {}) : {};
+    if (userDoc.isAdmin === true) return auth;
+  } catch (err) {
+    console.error('Admin lookup failed:', err.message);
+  }
+
+  jsonError(res, 403, 'admin_required', 'Admin access required.');
+  return null;
+}
+
 function sanitizeMessageText(value, maxLength) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
 }
@@ -319,7 +347,7 @@ function formatQuotaResponse(quota) {
   };
 }
 
-async function consumeServerAIQuota(userRef, nowUtc) {
+async function consumeServerAIQuota(userRef, nowUtc, requestedTier) {
   return db.runTransaction(async (tx) => {
     const snap = await tx.get(userRef);
     const userDoc = snap.exists ? (snap.data() || {}) : {};
@@ -327,8 +355,12 @@ async function consumeServerAIQuota(userRef, nowUtc) {
     const log = pruneKeyedLog(userDoc.aiUsageLog || {}, quota.periodKey);
     const used = parseInt(log[quota.periodKey] || 0, 10) || 0;
 
+    if (requestedTier === 'advanced' && !quota.isAdvanced) {
+      return Object.assign({ allowed: false, reason: 'advanced_ai_locked', used, remaining: Math.max(0, quota.limit - used) }, quota, { userDoc });
+    }
+
     if (used >= quota.limit) {
-      return Object.assign({ allowed: false, used, remaining: 0 }, quota, { userDoc });
+      return Object.assign({ allowed: false, reason: 'quota_exceeded', used, remaining: 0 }, quota, { userDoc });
     }
 
     log[quota.periodKey] = used + 1;
@@ -339,6 +371,27 @@ async function consumeServerAIQuota(userRef, nowUtc) {
 
     return Object.assign({ allowed: true, used: used + 1, remaining: quota.limit - (used + 1) }, quota, { userDoc });
   });
+}
+
+async function refundServerAIQuota(userRef, periodKey) {
+  if (!periodKey) return;
+  try {
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(userRef);
+      if (!snap.exists) return;
+      const userDoc = snap.data() || {};
+      const log = Object.assign({}, userDoc.aiUsageLog || {});
+      const used = parseInt(log[periodKey] || 0, 10) || 0;
+      if (used <= 0) return;
+      log[periodKey] = used - 1;
+      tx.set(userRef, {
+        aiUsageLog: log,
+        updatedAt: FieldValue.serverTimestamp()
+      }, { merge: true });
+    });
+  } catch (err) {
+    console.warn('AI quota refund failed:', err.message);
+  }
 }
 
 function getCatchupWindowStart(nowUtc, lastRunAt) {
@@ -398,6 +451,166 @@ app.get('/health', function(req, res) {
 
 app.get('/api/push/public-key', function(req, res) {
   res.json({ publicKey: process.env.VAPID_PUBLIC_KEY });
+});
+
+async function safeCount(query) {
+  try {
+    const snap = await query.count().get();
+    return snap.data().count || 0;
+  } catch (err) {
+    console.warn('Count query failed:', err.message);
+    return null;
+  }
+}
+
+function publicUserSummary(docSnap) {
+  const user = docSnap.data() || {};
+  return {
+    uid: user.uid || docSnap.id,
+    email: user.email || '',
+    displayName: user.displayName || '',
+    isAdmin: user.isAdmin === true || ADMIN_EMAILS.has(String(user.email || '').toLowerCase()),
+    isPremium: user.isPremium === true,
+    subscriptionPlan: user.subscriptionPlan || '',
+    notificationsEnabled: user.notificationsEnabled === true,
+    updatedAt: user.updatedAt || null
+  };
+}
+
+app.get('/api/admin/users', async function(req, res) {
+  const auth = await requireAdminAuth(req, res);
+  if (!auth) return;
+
+  const pageSize = Math.max(20, Math.min(120, parseInt(req.query.limit || '80', 10) || 80));
+  const pageToken = String(req.query.pageToken || '').trim();
+
+  try {
+    let query = db.collection('users').orderBy(FieldPath.documentId()).limit(pageSize);
+    if (pageToken) query = query.startAfter(pageToken);
+    const snap = await query.get();
+    const users = snap.docs.map(publicUserSummary);
+    const lastDoc = snap.docs[snap.docs.length - 1] || null;
+
+    const total = await safeCount(db.collection('users'));
+    const premium = await safeCount(db.collection('users').where('isPremium', '==', true));
+    const admins = ADMIN_EMAILS.size;
+
+    res.json({
+      ok: true,
+      users,
+      nextPageToken: snap.size === pageSize && lastDoc ? lastDoc.id : '',
+      stats: {
+        total,
+        premium,
+        admins,
+        trial: total == null || premium == null ? null : Math.max(0, total - premium - admins)
+      }
+    });
+  } catch (err) {
+    console.error('Admin users failed:', err.message);
+    jsonError(res, 500, 'admin_users_failed', 'Could not load users.');
+  }
+});
+
+app.post('/api/admin/premium', async function(req, res) {
+  const auth = await requireAdminAuth(req, res);
+  if (!auth) return;
+
+  const uid = String((req.body || {}).uid || '').trim();
+  const grant = (req.body || {}).isPremium === true;
+  if (!uid) return jsonError(res, 400, 'missing_uid', 'Missing user id.');
+
+  try {
+    await db.collection('users').doc(uid).set({
+      isPremium: grant,
+      subscriptionPlan: grant ? 'admin_grant' : null,
+      updatedAt: FieldValue.serverTimestamp(),
+      premiumUpdatedBy: auth.email || auth.uid
+    }, { merge: true });
+    res.json({ ok: true, uid, isPremium: grant });
+  } catch (err) {
+    console.error('Admin premium failed:', err.message);
+    jsonError(res, 500, 'premium_update_failed', 'Could not update premium.');
+  }
+});
+
+app.post('/api/admin/broadcast', async function(req, res) {
+  const auth = await requireAdminAuth(req, res);
+  if (!auth) return;
+
+  const body = sanitizeMessageText((req.body || {}).body, 100);
+  const clear = (req.body || {}).clear === true;
+
+  try {
+    if (clear) {
+      await db.collection('broadcasts').doc('global').set({
+        id: '',
+        body: '',
+        createdBy: '',
+        createdByName: '',
+        clearedAt: FieldValue.serverTimestamp()
+      }, { merge: true });
+      lastBroadcastProcessedId = '';
+      return res.json({ ok: true, cleared: true });
+    }
+
+    if (!body) return jsonError(res, 400, 'missing_message', 'Write a message first.');
+
+    const payload = {
+      id: 'bc_' + Date.now(),
+      body,
+      createdBy: auth.email || auth.uid,
+      createdByName: auth.name || auth.email || 'Admin',
+      updatedAt: FieldValue.serverTimestamp()
+    };
+    await db.collection('broadcasts').doc('global').set(payload, { merge: true });
+    setImmediate(() => processBroadcasts(true).catch((err) => console.error('broadcast immediate push error', err.message)));
+    res.json({ ok: true, broadcast: payload });
+  } catch (err) {
+    console.error('Admin broadcast failed:', err.message);
+    jsonError(res, 500, 'broadcast_failed', 'Broadcast failed.');
+  }
+});
+
+app.post('/api/promo/redeem', async function(req, res) {
+  const auth = await requireFirebaseAuth(req, res);
+  if (!auth) return;
+
+  const code = String((req.body || {}).code || '').trim().toUpperCase();
+  if (!code) return jsonError(res, 400, 'missing_code', 'Enter a code.');
+
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const promoRef = db.collection('promoCodes').doc(code);
+      const userRef = db.collection('users').doc(auth.uid);
+      const promoSnap = await tx.get(promoRef);
+      if (!promoSnap.exists) return { ok: false, code: 'invalid_code', message: 'Invalid code.' };
+      const promo = promoSnap.data() || {};
+      const used = parseInt(promo.used || 0, 10) || 0;
+      const maxUses = parseInt(promo.maxUses || 0, 10) || 0;
+      if (maxUses <= 0 || used >= maxUses) return { ok: false, code: 'code_used_up', message: 'Code used up.' };
+
+      tx.set(userRef, {
+        isPremium: true,
+        subscriptionPlan: 'promo',
+        promoCode: code,
+        updatedAt: FieldValue.serverTimestamp()
+      }, { merge: true });
+      tx.update(promoRef, {
+        used: used + 1,
+        lastUsedAt: FieldValue.serverTimestamp(),
+        lastUsedBy: auth.email || auth.uid
+      });
+
+      return { ok: true, days: promo.days || 30 };
+    });
+
+    if (!result.ok) return jsonError(res, result.code === 'invalid_code' ? 404 : 409, result.code, result.message);
+    res.json(result);
+  } catch (err) {
+    console.error('Promo redeem failed:', err.message);
+    jsonError(res, 500, 'promo_failed', 'Could not redeem code.');
+  }
 });
 
 app.post('/api/push/subscribe', async function(req, res) {
@@ -464,10 +677,10 @@ app.post('/api/chat', async function(req, res) {
   if (!safeMessage) return jsonError(res, 400, 'missing_data', 'Missing message.');
 
   const userRef = db.collection('users').doc(auth.uid);
-  const quota = await consumeServerAIQuota(userRef, DateTime.utc());
+  const quota = await consumeServerAIQuota(userRef, DateTime.utc(), tier);
   const userDoc = quota.userDoc || {};
 
-  if (tier === 'advanced' && !quota.isAdvanced) {
+  if (!quota.allowed && quota.reason === 'advanced_ai_locked') {
     return jsonError(res, 403, 'advanced_ai_locked', 'Advanced AI is only available for Premium/Admin.', {
       quota: formatQuotaResponse(quota)
     });
@@ -501,12 +714,16 @@ app.post('/api/chat', async function(req, res) {
     });
   } catch (err) {
     console.error('AI Error:', err.message);
+    await refundServerAIQuota(userRef, quota.periodKey);
     res.status(500).json({ code: 'ai_unavailable', error: 'AI unavailable right now. Try again.' });
   }
 });
 
 async function processScheduledNotifications() {
-  const usersSnap = await db.collection('users').where('notificationsEnabled', '==', true).get();
+  if (scheduleRunning) return;
+  scheduleRunning = true;
+  try {
+  const usersSnap = await getNextScheduledUserPage();
   const nowUtc = DateTime.utc();
   const windowStartUtc = getCatchupWindowStart(nowUtc, lastScheduleSweepAt);
   lastScheduleSweepAt = nowUtc.toMillis();
@@ -523,7 +740,8 @@ async function processScheduledNotifications() {
 
     const userDataSnap = await db.collection('userData').doc(uid).get();
     const userData = userDataSnap.exists ? (userDataSnap.data() || {}) : {};
-    const notificationMeta = Object.assign({}, userDoc.notificationMeta || {});
+    const notificationMeta = pruneNotificationMeta(userDoc.notificationMeta || {}, nowUtc.toMillis());
+    let changed = false;
 
     for (const slot of SMART_NOTIFICATION_SLOTS) {
       const dueMoment = findDueLocalMomentForClock(slot.hour, slot.minute, localWindowStart, localNow);
@@ -534,11 +752,7 @@ async function processScheduledNotifications() {
       const payload = buildSmartNotification(slot.key, userDoc, userData);
       subscriptions = await sendToSubscriptions(subscriptions, payload);
       notificationMeta[logKey] = Date.now();
-      await userDocSnap.ref.set({
-        pushSubscriptions: subscriptions,
-        notificationMeta,
-        updatedAt: FieldValue.serverTimestamp()
-      }, { merge: true });
+      changed = true;
     }
 
     const reminders = (userData.reminders || []).filter((item) => item && item.enabled !== false);
@@ -551,6 +765,10 @@ async function processScheduledNotifications() {
       const payload = buildReminderNotification(reminder, userDoc, userData);
       subscriptions = await sendToSubscriptions(subscriptions, payload);
       notificationMeta[logKey] = Date.now();
+      changed = true;
+    }
+
+    if (changed) {
       await userDocSnap.ref.set({
         pushSubscriptions: subscriptions,
         notificationMeta,
@@ -558,35 +776,85 @@ async function processScheduledNotifications() {
       }, { merge: true });
     }
   }
+  } finally {
+    scheduleRunning = false;
+  }
 }
 
-async function processBroadcasts() {
-  const broadcastSnap = await db.collection('broadcasts').doc('global').get();
-  if (!broadcastSnap.exists) return;
+async function getNextScheduledUserPage() {
+  try {
+    let query = db.collection('users')
+      .where('notificationsEnabled', '==', true)
+      .orderBy(FieldPath.documentId())
+      .limit(SCHEDULE_SWEEP_LIMIT);
+    if (scheduleCursorId) query = query.startAfter(scheduleCursorId);
+    let snap = await query.get();
+    if (snap.empty && scheduleCursorId) {
+      scheduleCursorId = '';
+      snap = await db.collection('users')
+        .where('notificationsEnabled', '==', true)
+        .orderBy(FieldPath.documentId())
+        .limit(SCHEDULE_SWEEP_LIMIT)
+        .get();
+    }
+    const last = snap.docs[snap.docs.length - 1];
+    scheduleCursorId = snap.size === SCHEDULE_SWEEP_LIMIT && last ? last.id : '';
+    return snap;
+  } catch (err) {
+    console.warn('Paginated schedule query failed, using limited fallback:', err.message);
+    scheduleCursorId = '';
+    return db.collection('users').where('notificationsEnabled', '==', true).limit(SCHEDULE_SWEEP_LIMIT).get();
+  }
+}
 
-  const broadcast = broadcastSnap.data() || {};
-  if (!broadcast.id || !broadcast.body) return;
+function pruneNotificationMeta(meta, nowMs) {
+  const cutoff = nowMs - (45 * 86400000);
+  const next = {};
+  Object.keys(meta || {}).forEach((key) => {
+    const value = parseInt(meta[key] || 0, 10) || 0;
+    if (!value || value >= cutoff) next[key] = meta[key];
+  });
+  return next;
+}
 
-  const usersSnap = await db.collection('users').where('notificationsEnabled', '==', true).get();
-  for (const userDocSnap of usersSnap.docs) {
-    const userDoc = userDocSnap.data() || {};
-    const subscriptions = uniqueByEndpoint(userDoc.pushSubscriptions || []);
-    if (!subscriptions.length) continue;
-    if (userDoc.lastBroadcastPushId === broadcast.id) continue;
+async function processBroadcasts(force) {
+  if (broadcastRunning) return;
+  broadcastRunning = true;
+  try {
+    const broadcastSnap = await db.collection('broadcasts').doc('global').get();
+    if (!broadcastSnap.exists) return;
 
-    const payload = {
-      title: '📣 Jordyn update',
-      body: String(broadcast.body).slice(0, 100),
-      tag: `jhb-broadcast-${broadcast.id}`,
-      data: { page: 'Home', url: '/#open-page=Home', broadcastId: broadcast.id }
-    };
+    const broadcast = broadcastSnap.data() || {};
+    if (!broadcast.id || !broadcast.body) return;
+    if (!force && broadcast.id === lastBroadcastProcessedId) return;
 
-    const alive = await sendToSubscriptions(subscriptions, payload);
-    await userDocSnap.ref.set({
-      pushSubscriptions: alive,
-      lastBroadcastPushId: broadcast.id,
-      updatedAt: FieldValue.serverTimestamp()
-    }, { merge: true });
+    const usersSnap = await db.collection('users').where('notificationsEnabled', '==', true).get();
+    for (let i = 0; i < usersSnap.docs.length; i += BROADCAST_BATCH_SIZE) {
+      const batch = usersSnap.docs.slice(i, i + BROADCAST_BATCH_SIZE);
+      await Promise.all(batch.map(async (userDocSnap) => {
+        const userDoc = userDocSnap.data() || {};
+        const subscriptions = uniqueByEndpoint(userDoc.pushSubscriptions || []);
+        if (!subscriptions.length) return;
+        if (userDoc.lastBroadcastPushId === broadcast.id) return;
+
+        const payload = {
+          title: '📣 Jordyn update',
+          body: String(broadcast.body).slice(0, 100),
+          tag: `jhb-broadcast-${broadcast.id}`,
+          data: { page: 'Home', url: '/#open-page=Home', broadcastId: broadcast.id }
+        };
+
+        const alive = await sendToSubscriptions(subscriptions, payload);
+        await userDocSnap.ref.set({
+          pushSubscriptions: alive,
+          lastBroadcastPushId: broadcast.id,
+          updatedAt: FieldValue.serverTimestamp()
+        }, { merge: true });
+      }));
+    }
+    lastBroadcastProcessedId = broadcast.id;
+  } finally {
+    broadcastRunning = false;
   }
 }
 
@@ -609,4 +877,3 @@ app.listen(PORT, () => {
   processScheduledNotifications().catch((err) => console.error('scheduled notification startup error', err.message));
   processBroadcasts().catch((err) => console.error('broadcast startup error', err.message));
 });
-

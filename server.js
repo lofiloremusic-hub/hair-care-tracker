@@ -481,8 +481,9 @@ app.get('/api/admin/users', async function(req, res) {
   const auth = await requireAdminAuth(req, res);
   if (!auth) return;
 
-  const pageSize = Math.max(20, Math.min(120, parseInt(req.query.limit || '80', 10) || 80));
+  const pageSize = Math.max(20, Math.min(80, parseInt(req.query.limit || '40', 10) || 40));
   const pageToken = String(req.query.pageToken || '').trim();
+  const includeStats = String(req.query.includeStats || '') === '1';
 
   try {
     let query = db.collection('users').orderBy(FieldPath.documentId()).limit(pageSize);
@@ -490,21 +491,29 @@ app.get('/api/admin/users', async function(req, res) {
     const snap = await query.get();
     const users = snap.docs.map(publicUserSummary);
     const lastDoc = snap.docs[snap.docs.length - 1] || null;
+    const nextPageToken = snap.size === pageSize && lastDoc ? lastDoc.id : '';
 
-    const total = await safeCount(db.collection('users'));
-    const premium = await safeCount(db.collection('users').where('isPremium', '==', true));
     const admins = ADMIN_EMAILS.size;
+    const stats = {
+      total: users.length + (nextPageToken ? '+' : ''),
+      premium: null,
+      admins,
+      trial: null
+    };
+
+    if (includeStats) {
+      const total = await safeCount(db.collection('users'));
+      const premium = await safeCount(db.collection('users').where('isPremium', '==', true));
+      stats.total = total;
+      stats.premium = premium;
+      stats.trial = total == null || premium == null ? null : Math.max(0, total - premium - admins);
+    }
 
     res.json({
       ok: true,
       users,
-      nextPageToken: snap.size === pageSize && lastDoc ? lastDoc.id : '',
-      stats: {
-        total,
-        premium,
-        admins,
-        trial: total == null || premium == null ? null : Math.max(0, total - premium - admins)
-      }
+      nextPageToken,
+      stats
     });
   } catch (err) {
     console.error('Admin users failed:', err.message);

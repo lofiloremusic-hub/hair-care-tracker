@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -82,10 +81,30 @@ const AI_LIMITS = {
 };
 
 const MAX_AI_HISTORY_ITEMS = 12;
+const AI_REQUEST_TIMEOUT_MS = Math.max(20000, Math.min(120000, parseInt(process.env.AI_REQUEST_TIMEOUT_MS || '70000', 10) || 70000));
+const AI_RETRY_DELAY_MS = Math.max(300, Math.min(5000, parseInt(process.env.AI_RETRY_DELAY_MS || '900', 10) || 900));
 const SCHEDULE_CATCHUP_MINUTES = Math.max(12, parseInt(process.env.SCHEDULE_CATCHUP_MINUTES || '24', 10) || 24);
 const SCHEDULE_SWEEP_LIMIT = Math.max(50, Math.min(500, parseInt(process.env.SCHEDULE_SWEEP_LIMIT || '250', 10) || 250));
 const BROADCAST_BATCH_SIZE = Math.max(10, Math.min(100, parseInt(process.env.BROADCAST_BATCH_SIZE || '40', 10) || 40));
 const ADMIN_EMAILS = new Set(['iamkaransingh0709@gmail.com', 'jordynjada03@gmail.com']);
+
+function parseAIModels(value, fallback) {
+  const seen = new Set();
+  return String(value || '')
+    .split(',')
+    .concat(fallback || [])
+    .map((model) => String(model || '').trim())
+    .filter((model) => {
+      if (!model || seen.has(model)) return false;
+      seen.add(model);
+      return true;
+    });
+}
+
+const AI_MODELS = {
+  advanced: parseAIModels(process.env.AI_ADVANCED_MODELS || process.env.AI_MODEL_ADVANCED, ['openrouter/auto']),
+  standard: parseAIModels(process.env.AI_STANDARD_MODELS || process.env.AI_MODEL_STANDARD || process.env.AI_MODEL_FREE, ['openrouter/auto'])
+};
 
 let lastScheduleSweepAt = 0;
 let scheduleCursorId = '';
@@ -317,6 +336,49 @@ function sanitizeAIHistory(history) {
     role: item && item.role === 'ai' ? 'assistant' : 'user',
     content: sanitizeMessageText(item && item.text, 1200)
   })).filter((item) => item.content);
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableAIError(err) {
+  const status = parseInt(err && (err.status || err.statusCode), 10);
+  const msg = String((err && (err.message || err.code)) || '').toLowerCase();
+  return !status || status === 408 || status === 409 || status === 425 || status === 429 || status >= 500
+    || msg.includes('timeout')
+    || msg.includes('aborted')
+    || msg.includes('fetch')
+    || msg.includes('overload')
+    || msg.includes('temporarily');
+}
+
+async function createAICompletionWithFallback(messages, isAdvanced) {
+  const models = isAdvanced ? AI_MODELS.advanced : AI_MODELS.standard;
+  let lastErr = null;
+
+  for (const model of models) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const response = await openai.chat.completions.create({
+          model,
+          messages,
+          temperature: isAdvanced ? 0.74 : 0.62,
+          max_tokens: isAdvanced ? 1200 : 780
+        }, {
+          timeout: AI_REQUEST_TIMEOUT_MS
+        });
+        return { response, model };
+      } catch (err) {
+        lastErr = err;
+        console.warn('AI model attempt failed:', model, 'attempt', attempt + 1, (err && err.message) || err);
+        if (!isRetryableAIError(err) || attempt === 1) break;
+        await wait(AI_RETRY_DELAY_MS * (attempt + 1));
+      }
+    }
+  }
+
+  throw lastErr || new Error('AI completion failed');
 }
 
 function pruneKeyedLog(log, keepKey) {
@@ -703,21 +765,30 @@ app.post('/api/chat', async function(req, res) {
     });
   }
 
-  const messages = [{ role: 'system', content: sanitizeMessageText(context || 'You are a warm hair care expert.', 4000) }];
+  const responseContract = [
+    sanitizeMessageText(context || 'You are a warm hair care expert.', 4000),
+    quota.isAdvanced
+      ? 'Advanced mode: be highly personal, specific, and premium-feeling. Use the user profile, logs, products, goals, and recent signals when present.'
+      : 'Free mode: be warm and useful, but keep it shorter. Do not mention advanced-only audits or tell the user they are premium.',
+    'Format contract: reply in clean mobile-card sections only. Use these labels in this order when relevant: Diagnosis:, Today:, Routine:, Product Picks:, Next Move:.',
+    'Under each label write 1-3 short bullets. No markdown bold, no hashtags, no long essay paragraphs, no fake certainty, no "stay tuned", and no upgrade pitch unless the user explicitly asks about premium.',
+    'Tone: supportive, personal, easy to read, and lightly emoji-led. Every line should feel useful.'
+  ].join(' ');
+
+  const messages = [{ role: 'system', content: responseContract }];
   sanitizeAIHistory(history).forEach((m) => {
     messages.push(m);
   });
   messages.push({ role: 'user', content: safeMessage });
 
   try {
-    const response = await openai.chat.completions.create({
-      model: quota.isAdvanced ? 'openrouter/auto' : 'openrouter/free',
-      messages
-    });
+    const completion = await createAICompletionWithFallback(messages, quota.isAdvanced);
+    const response = completion.response;
     res.json({
       reply: response.choices[0].message.content,
       quota: formatQuotaResponse(quota),
       tier: quota.isAdvanced ? 'advanced' : 'standard',
+      model: completion.model,
       uid: auth.uid,
       plan: userDoc.isAdmin ? 'admin' : userDoc.isPremium ? 'premium' : 'free'
     });

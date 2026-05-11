@@ -535,7 +535,113 @@ function publicUserSummary(docSnap) {
     isPremium: user.isPremium === true,
     subscriptionPlan: user.subscriptionPlan || '',
     notificationsEnabled: user.notificationsEnabled === true,
+    timezone: user.timezone || '',
+    createdAt: user.createdAt || null,
+    lastLoginAt: user.lastLoginAt || null,
     updatedAt: user.updatedAt || null
+  };
+}
+
+function safeArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function shortText(value, limit) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  return text.length > limit ? text.slice(0, limit - 1) + '…' : text;
+}
+
+function safeTimestamp(value) {
+  if (!value) return null;
+  if (typeof value.toDate === 'function') return value.toDate().toISOString();
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === 'number') return new Date(value).toISOString();
+  return value;
+}
+
+function compactReminder(reminder) {
+  reminder = reminder || {};
+  return {
+    id: reminder.id || '',
+    title: shortText(reminder.title || reminder.name || reminder.type || 'Reminder', 80),
+    type: reminder.type || '',
+    date: reminder.date || reminder.ds || reminder.day || '',
+    time: reminder.time || '',
+    frequency: reminder.frequency || reminder.freq || '',
+    enabled: reminder.enabled !== false
+  };
+}
+
+function compactProduct(product) {
+  product = product || {};
+  return {
+    id: product.id || '',
+    name: shortText(product.name || 'Product', 80),
+    brand: shortText(product.brand || '', 60),
+    category: product.category || product.cat || '',
+    rating: product.rating || product.rate || null,
+    inUse: product.inUse !== false && product.active !== false
+  };
+}
+
+function latestByDate(items) {
+  return safeArray(items).slice().sort(function(a, b) {
+    const ad = new Date(a.date || a.ds || a.ts || 0).getTime() || 0;
+    const bd = new Date(b.date || b.ds || b.ts || 0).getTime() || 0;
+    return bd - ad;
+  })[0] || null;
+}
+
+function buildAdminUserDetail(userSnap, dataSnap) {
+  const user = userSnap.data() || {};
+  const userData = dataSnap && dataSnap.exists ? (dataSnap.data() || {}) : {};
+  const profile = userData.profile || {};
+  const reminders = safeArray(userData.reminders);
+  const products = safeArray(userData.products);
+  const checkins = safeArray(userData.checkins);
+  const growth = safeArray(userData.growth);
+  const galleryCount = Math.max(
+    safeArray(userData.gallery).length,
+    Number((userData.galleryCloud || {}).itemCount || 0) || 0
+  );
+  const goals = safeArray(profile.hairGoals || profile.goals || profile.goal).filter(Boolean);
+
+  return {
+    uid: user.uid || userSnap.id,
+    email: user.email || '',
+    displayName: user.displayName || profile.name || '',
+    isAdmin: user.isAdmin === true || ADMIN_EMAILS.has(String(user.email || '').toLowerCase()),
+    isPremium: user.isPremium === true,
+    subscriptionPlan: user.subscriptionPlan || '',
+    notificationsEnabled: user.notificationsEnabled === true,
+    timezone: user.timezone || profile.timezone || '',
+    createdAt: safeTimestamp(user.createdAt),
+    lastLoginAt: safeTimestamp(user.lastLoginAt),
+    updatedAt: safeTimestamp(user.updatedAt || userData.updatedAt),
+    profile: {
+      name: profile.name || user.displayName || '',
+      hairType: profile.hairType || '',
+      hairColor: profile.hairColor || '',
+      treatment: profile.treatment || '',
+      hairGoal: profile.hairGoal || profile.goal || '',
+      hairGoals: goals,
+      lengthUnit: profile.lenUnit || profile.lengthUnit || '',
+      temperatureUnit: profile.tempUnit || profile.temperatureUnit || '',
+      monthlyGoal: profile.goalDays || profile.monthlyGoal || null
+    },
+    counts: {
+      checkins: checkins.length,
+      growth: growth.length,
+      products: products.length,
+      reminders: reminders.length,
+      gallery: galleryCount,
+      aiMessages: safeArray(userData.aiHistory).length
+    },
+    streak: userData.streak || profile.streak || 0,
+    lastCheckin: latestByDate(checkins),
+    lastGrowth: latestByDate(growth),
+    activeProducts: products.filter(function(p) { return p && p.inUse !== false && p.active !== false; }).slice(0, 8).map(compactProduct),
+    remindersPreview: reminders.slice(0, 12).map(compactReminder)
   };
 }
 
@@ -580,6 +686,26 @@ app.get('/api/admin/users', async function(req, res) {
   } catch (err) {
     console.error('Admin users failed:', err.message);
     jsonError(res, 500, 'admin_users_failed', 'Could not load users.');
+  }
+});
+
+app.get('/api/admin/user-detail', async function(req, res) {
+  const auth = await requireAdminAuth(req, res);
+  if (!auth) return;
+
+  const uid = String(req.query.uid || '').trim();
+  if (!uid) return jsonError(res, 400, 'missing_uid', 'Missing user id.');
+
+  try {
+    const [userSnap, dataSnap] = await Promise.all([
+      db.collection('users').doc(uid).get(),
+      db.collection('userData').doc(uid).get()
+    ]);
+    if (!userSnap.exists) return jsonError(res, 404, 'user_not_found', 'User was not found.');
+    res.json({ ok: true, detail: buildAdminUserDetail(userSnap, dataSnap) });
+  } catch (err) {
+    console.error('Admin user detail failed:', err.message);
+    jsonError(res, 500, 'admin_user_detail_failed', 'Could not load user detail.');
   }
 });
 

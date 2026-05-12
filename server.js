@@ -7,6 +7,7 @@ const http = require('http');
 const webpush = require('web-push');
 const admin = require('firebase-admin');
 const { DateTime } = require('luxon');
+const Stripe = require('stripe');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -27,6 +28,8 @@ app.use(cors({
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
+
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
 
 app.use(express.json({ limit: '40kb' }));
 
@@ -87,6 +90,13 @@ const SCHEDULE_CATCHUP_MINUTES = Math.max(12, parseInt(process.env.SCHEDULE_CATC
 const SCHEDULE_SWEEP_LIMIT = Math.max(50, Math.min(500, parseInt(process.env.SCHEDULE_SWEEP_LIMIT || '250', 10) || 250));
 const BROADCAST_BATCH_SIZE = Math.max(10, Math.min(100, parseInt(process.env.BROADCAST_BATCH_SIZE || '40', 10) || 40));
 const ADMIN_EMAILS = new Set(['iamkaransingh0709@gmail.com', 'jordynjada03@gmail.com']);
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+const STRIPE_PRICE_PREMIUM_MONTHLY = process.env.STRIPE_PRICE_PREMIUM_MONTHLY || process.env.STRIPE_PREMIUM_PRICE_ID || '';
+const STRIPE_TRIAL_DAYS = Math.max(0, Math.min(60, parseInt(process.env.STRIPE_TRIAL_DAYS || '14', 10) || 14));
+const STRIPE_SUCCESS_URL = (process.env.STRIPE_SUCCESS_URL || 'https://jordyn-haircare.web.app/#open-page=Premium').trim();
+const STRIPE_CANCEL_URL = (process.env.STRIPE_CANCEL_URL || 'https://jordyn-haircare.web.app/#open-page=Premium').trim();
+const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
 function parseAIModels(value, fallback) {
   const seen = new Set();
@@ -241,6 +251,34 @@ async function sendToSubscriptions(subscriptions, payload) {
   return alive;
 }
 
+async function sendToSubscriptionsWithStats(subscriptions, payload) {
+  const alive = [];
+  const stats = {
+    sent: 0,
+    failed: 0,
+    removed: 0
+  };
+
+  for (const sub of subscriptions || []) {
+    try {
+      await webpush.sendNotification(sub, JSON.stringify(payload));
+      stats.sent += 1;
+      alive.push(sub);
+    } catch (err) {
+      const code = err && err.statusCode;
+      if (code === 404 || code === 410) {
+        stats.removed += 1;
+      } else {
+        stats.failed += 1;
+        alive.push(sub);
+        console.warn('Broadcast push failed for one subscription:', (err && err.message) || err);
+      }
+    }
+  }
+
+  return { alive, stats };
+}
+
 function uniqueByEndpoint(list) {
   const seen = new Set();
   return (list || []).filter((sub) => {
@@ -328,6 +366,206 @@ async function requireAdminAuth(req, res) {
 
 function sanitizeMessageText(value, maxLength) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
+}
+
+function compactDefined(value) {
+  const out = {};
+  Object.keys(value || {}).forEach((key) => {
+    if (value[key] !== undefined) out[key] = value[key];
+  });
+  return out;
+}
+
+function stripeUnixToDate(value) {
+  const n = parseInt(value || 0, 10) || 0;
+  return n > 0 ? new Date(n * 1000) : null;
+}
+
+function stripeReady(res, needsPrice) {
+  if (!stripe) {
+    jsonError(res, 503, 'stripe_not_configured', 'Stripe is not configured yet.');
+    return false;
+  }
+  if (needsPrice && !STRIPE_PRICE_PREMIUM_MONTHLY) {
+    jsonError(res, 503, 'stripe_price_missing', 'Premium price is not configured yet.');
+    return false;
+  }
+  return true;
+}
+
+function addQueryParam(url, key, value) {
+  const hashIndex = url.indexOf('#');
+  const base = hashIndex === -1 ? url : url.slice(0, hashIndex);
+  const hash = hashIndex === -1 ? '' : url.slice(hashIndex);
+  const joiner = base.indexOf('?') === -1 ? '?' : '&';
+  const encodedValue = String(value) === '{CHECKOUT_SESSION_ID}' ? value : encodeURIComponent(value);
+  return base + joiner + encodeURIComponent(key) + '=' + encodedValue + hash;
+}
+
+async function findUserRefByStripeCustomer(customerId) {
+  if (!customerId) return null;
+  const snap = await db.collection('users').where('stripeCustomerId', '==', customerId).limit(1).get();
+  return snap.empty ? null : snap.docs[0].ref;
+}
+
+async function ensureStripeCustomer(auth, userRef, userDoc) {
+  if (userDoc && userDoc.stripeCustomerId) return userDoc.stripeCustomerId;
+
+  const customer = await stripe.customers.create(compactDefined({
+    email: auth.email || userDoc.email || undefined,
+    name: auth.name || userDoc.displayName || undefined,
+    metadata: {
+      uid: auth.uid,
+      app: 'jordyn-haircare'
+    }
+  }));
+
+  await userRef.set({
+    stripeCustomerId: customer.id,
+    updatedAt: FieldValue.serverTimestamp()
+  }, { merge: true });
+
+  return customer.id;
+}
+
+async function writeStripePremiumState(uid, state) {
+  const userRef = db.collection('users').doc(uid);
+  const isPremium = state.isPremium === true;
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+    const existing = snap.exists ? (snap.data() || {}) : {};
+
+    if (!isPremium && existing.isAdmin === true) return;
+    if (!isPremium && existing.subscriptionPlan && existing.subscriptionPlan !== 'stripe') return;
+    if (!isPremium && state.stripeSubscriptionId && existing.stripeSubscriptionId && existing.stripeSubscriptionId !== state.stripeSubscriptionId) return;
+
+    tx.set(userRef, compactDefined({
+      isPremium,
+      subscriptionPlan: isPremium ? 'stripe' : null,
+      premiumSource: isPremium ? 'stripe' : null,
+      premiumStatus: state.status || null,
+      stripeCustomerId: state.stripeCustomerId || existing.stripeCustomerId || undefined,
+      stripeSubscriptionId: state.stripeSubscriptionId || existing.stripeSubscriptionId || null,
+      stripePriceId: state.stripePriceId || existing.stripePriceId || null,
+      stripeCancelAtPeriodEnd: state.cancelAtPeriodEnd === undefined ? null : !!state.cancelAtPeriodEnd,
+      stripeCurrentPeriodEnd: state.currentPeriodEnd || null,
+      stripeTrialEnd: state.trialEnd || null,
+      premiumPaymentProblem: state.paymentProblem === undefined ? existing.premiumPaymentProblem : !!state.paymentProblem,
+      updatedAt: FieldValue.serverTimestamp()
+    }), { merge: true });
+  });
+
+  await db.collection('userData').doc(uid).set({
+    profile: compactDefined({
+      premium: isPremium,
+      isPremium,
+      subscriptionPlan: isPremium ? 'stripe' : null,
+      premiumStatus: state.status || null,
+      stripeCurrentPeriodEnd: state.currentPeriodEnd || null
+    }),
+    syncMeta: {
+      collections: {
+        profile: Date.now()
+      }
+    },
+    updatedAt: FieldValue.serverTimestamp()
+  }, { merge: true });
+}
+
+async function syncStripeSubscription(subscription, fallbackUid) {
+  if (!subscription) return null;
+  const customerId = typeof subscription.customer === 'string' ? subscription.customer : subscription.customer && subscription.customer.id;
+  const uidFromMeta = subscription.metadata && subscription.metadata.uid;
+  let uid = fallbackUid || uidFromMeta || '';
+  let userRef = uid ? db.collection('users').doc(uid) : null;
+  if (!userRef && customerId) userRef = await findUserRefByStripeCustomer(customerId);
+  if (!userRef) return null;
+  uid = userRef.id;
+
+  const status = String(subscription.status || '').toLowerCase();
+  const accessStatuses = new Set(['active', 'trialing', 'past_due']);
+  const firstItem = subscription.items && subscription.items.data && subscription.items.data[0];
+  const priceId = firstItem && firstItem.price && firstItem.price.id;
+
+  await writeStripePremiumState(uid, {
+    isPremium: accessStatuses.has(status),
+    status,
+    stripeCustomerId: customerId,
+    stripeSubscriptionId: subscription.id,
+    stripePriceId: priceId,
+    cancelAtPeriodEnd: subscription.cancel_at_period_end,
+    currentPeriodEnd: stripeUnixToDate(subscription.current_period_end),
+    trialEnd: stripeUnixToDate(subscription.trial_end),
+    paymentProblem: status === 'past_due'
+  });
+
+  return uid;
+}
+
+async function handleStripeWebhook(req, res) {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) {
+    console.error('Stripe webhook hit before Stripe env was configured.');
+    return res.status(503).send('stripe_not_configured');
+  }
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Stripe webhook signature failed:', err.message);
+    return res.status(400).send('bad_signature');
+  }
+
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object || {};
+      const uid = (session.metadata && session.metadata.uid) || session.client_reference_id || '';
+      if (session.subscription) {
+        const subscription = typeof session.subscription === 'string'
+          ? await stripe.subscriptions.retrieve(session.subscription)
+          : session.subscription;
+        await syncStripeSubscription(subscription, uid);
+      } else if (uid) {
+        await writeStripePremiumState(uid, {
+          isPremium: true,
+          status: 'active',
+          stripeCustomerId: typeof session.customer === 'string' ? session.customer : session.customer && session.customer.id
+        });
+      }
+    } else if (event.type === 'customer.subscription.created' || event.type === 'customer.subscription.updated') {
+      await syncStripeSubscription(event.data.object);
+    } else if (event.type === 'customer.subscription.deleted') {
+      const subscription = event.data.object || {};
+      const customerId = typeof subscription.customer === 'string' ? subscription.customer : subscription.customer && subscription.customer.id;
+      const uid = subscription.metadata && subscription.metadata.uid;
+      const userRef = uid ? db.collection('users').doc(uid) : await findUserRefByStripeCustomer(customerId);
+      if (userRef) {
+        await writeStripePremiumState(userRef.id, {
+          isPremium: false,
+          status: 'canceled',
+          stripeCustomerId: customerId,
+          stripeSubscriptionId: subscription.id
+        });
+      }
+    } else if (event.type === 'invoice.payment_succeeded' || event.type === 'invoice.payment_failed') {
+      const invoice = event.data.object || {};
+      const customerId = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer && invoice.customer.id;
+      const userRef = await findUserRefByStripeCustomer(customerId);
+      if (userRef) {
+        await userRef.set({
+          premiumPaymentProblem: event.type === 'invoice.payment_failed',
+          premiumStatus: event.type === 'invoice.payment_failed' ? 'payment_failed' : 'active',
+          updatedAt: FieldValue.serverTimestamp()
+        }, { merge: true });
+      }
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error('Stripe webhook handling failed:', err.message);
+    res.status(500).send('webhook_failed');
+  }
 }
 
 function sanitizeAIHistory(history) {
@@ -513,6 +751,88 @@ app.get('/health', function(req, res) {
 
 app.get('/api/push/public-key', function(req, res) {
   res.json({ publicKey: process.env.VAPID_PUBLIC_KEY });
+});
+
+app.post('/api/stripe/create-checkout-session', async function(req, res) {
+  const auth = await requireFirebaseAuth(req, res);
+  if (!auth) return;
+  if (!stripeReady(res, true)) return;
+
+  try {
+    const userRef = db.collection('users').doc(auth.uid);
+    const userSnap = await userRef.get();
+    const userDoc = userSnap.exists ? (userSnap.data() || {}) : {};
+    const customerId = await ensureStripeCustomer(auth, userRef, userDoc);
+
+    if (userDoc.isPremium === true && userDoc.subscriptionPlan === 'stripe') {
+      const portal = await stripe.billingPortal.sessions.create({
+        customer: customerId,
+        return_url: STRIPE_SUCCESS_URL
+      });
+      return res.json({ ok: true, url: portal.url, mode: 'portal' });
+    }
+
+    if (userDoc.isPremium === true || userDoc.isAdmin === true) {
+      return res.json({ ok: true, alreadyPremium: true });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer: customerId,
+      client_reference_id: auth.uid,
+      line_items: [{ price: STRIPE_PRICE_PREMIUM_MONTHLY, quantity: 1 }],
+      allow_promotion_codes: true,
+      success_url: addQueryParam(addQueryParam(STRIPE_SUCCESS_URL, 'stripe', 'success'), 'session_id', '{CHECKOUT_SESSION_ID}'),
+      cancel_url: addQueryParam(STRIPE_CANCEL_URL, 'stripe', 'cancel'),
+      subscription_data: {
+        trial_period_days: STRIPE_TRIAL_DAYS,
+        metadata: {
+          uid: auth.uid,
+          app: 'jordyn-haircare'
+        }
+      },
+      metadata: {
+        uid: auth.uid,
+        app: 'jordyn-haircare',
+        product: 'premium'
+      }
+    });
+
+    await userRef.set({
+      stripeCheckoutSessionId: session.id,
+      stripeCustomerId: customerId,
+      updatedAt: FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    res.json({ ok: true, url: session.url, sessionId: session.id, trialDays: STRIPE_TRIAL_DAYS });
+  } catch (err) {
+    console.error('Stripe checkout failed:', err.message);
+    jsonError(res, 500, 'stripe_checkout_failed', 'Could not open secure checkout. Try again.');
+  }
+});
+
+app.post('/api/stripe/create-portal-session', async function(req, res) {
+  const auth = await requireFirebaseAuth(req, res);
+  if (!auth) return;
+  if (!stripeReady(res, false)) return;
+
+  try {
+    const userSnap = await db.collection('users').doc(auth.uid).get();
+    const userDoc = userSnap.exists ? (userSnap.data() || {}) : {};
+    if (!userDoc.stripeCustomerId) {
+      return jsonError(res, 404, 'stripe_customer_missing', 'No Stripe subscription was found for this account.');
+    }
+
+    const portal = await stripe.billingPortal.sessions.create({
+      customer: userDoc.stripeCustomerId,
+      return_url: STRIPE_SUCCESS_URL
+    });
+
+    res.json({ ok: true, url: portal.url });
+  } catch (err) {
+    console.error('Stripe portal failed:', err.message);
+    jsonError(res, 500, 'stripe_portal_failed', 'Could not open billing portal. Try again.');
+  }
 });
 
 async function safeCount(query) {
@@ -762,8 +1082,18 @@ app.post('/api/admin/broadcast', async function(req, res) {
       updatedAt: FieldValue.serverTimestamp()
     };
     await db.collection('broadcasts').doc('global').set(payload, { merge: true });
-    setImmediate(() => processBroadcasts(true).catch((err) => console.error('broadcast immediate push error', err.message)));
-    res.json({ ok: true, broadcast: payload });
+
+    try {
+      const pushStats = await processBroadcasts(true);
+      res.json({ ok: true, broadcast: payload, pushStats });
+    } catch (pushErr) {
+      console.error('Admin broadcast push failed:', pushErr.message);
+      await db.collection('broadcasts').doc('global').set({
+        pushError: pushErr.message || 'Broadcast push failed',
+        pushFailedAt: FieldValue.serverTimestamp()
+      }, { merge: true });
+      jsonError(res, 500, 'broadcast_push_failed', 'Broadcast was saved, but push delivery failed. Try again.');
+    }
   } catch (err) {
     console.error('Admin broadcast failed:', err.message);
     jsonError(res, 500, 'broadcast_failed', 'Broadcast failed.');
@@ -1025,35 +1355,42 @@ function pruneNotificationMeta(meta, nowMs) {
 }
 
 async function processBroadcasts(force) {
-  if (broadcastRunning) return;
+  if (broadcastRunning) return { running: true };
   broadcastRunning = true;
+  const stats = {
+    usersChecked: 0,
+    subscribedUsers: 0,
+    notificationsSent: 0,
+    failedSubscriptions: 0,
+    removedSubscriptions: 0,
+    skippedAlreadySent: 0
+  };
+
   try {
     const broadcastSnap = await db.collection('broadcasts').doc('global').get();
-    if (!broadcastSnap.exists) return;
+    if (!broadcastSnap.exists) return stats;
 
     const broadcast = broadcastSnap.data() || {};
-    if (!broadcast.id || !broadcast.body) return;
-    if (!force && broadcast.id === lastBroadcastProcessedId) return;
+    if (!broadcast.id || !broadcast.body) return stats;
+    if (!force && broadcast.id === lastBroadcastProcessedId) return stats;
 
-    let cursor = null;
-    let moreUsers = true;
-    while (moreUsers) {
-      let query = db.collection('users')
-        .where('notificationsEnabled', '==', true)
-        .orderBy(FieldPath.documentId())
-        .limit(BROADCAST_BATCH_SIZE);
-      if (cursor) query = query.startAfter(cursor);
-      const usersSnap = await query.get();
-      const batch = usersSnap.docs;
-      moreUsers = usersSnap.size === BROADCAST_BATCH_SIZE;
-      cursor = batch.length ? batch[batch.length - 1] : null;
-      if (!batch.length) break;
+    // Broadcasts are low-frequency admin actions. Pulling subscribed user docs once
+    // avoids fragile Firestore cursor/index combinations and is still safe for 3k+ users.
+    const usersSnap = await db.collection('users').where('notificationsEnabled', '==', true).get();
+    const docs = usersSnap.docs;
 
+    for (let i = 0; i < docs.length; i += BROADCAST_BATCH_SIZE) {
+      const batch = docs.slice(i, i + BROADCAST_BATCH_SIZE);
       await Promise.all(batch.map(async (userDocSnap) => {
         const userDoc = userDocSnap.data() || {};
         const subscriptions = uniqueByEndpoint(userDoc.pushSubscriptions || []);
+        stats.usersChecked += 1;
         if (!subscriptions.length) return;
-        if (userDoc.lastBroadcastPushId === broadcast.id) return;
+        stats.subscribedUsers += 1;
+        if (userDoc.lastBroadcastPushId === broadcast.id) {
+          stats.skippedAlreadySent += 1;
+          return;
+        }
 
         const payload = {
           title: '📣 Jordyn update',
@@ -1062,15 +1399,26 @@ async function processBroadcasts(force) {
           data: { page: 'Home', url: '/#open-page=Home', broadcastId: broadcast.id }
         };
 
-        const alive = await sendToSubscriptions(subscriptions, payload);
+        const result = await sendToSubscriptionsWithStats(subscriptions, payload);
+        stats.notificationsSent += result.stats.sent;
+        stats.failedSubscriptions += result.stats.failed;
+        stats.removedSubscriptions += result.stats.removed;
         await userDocSnap.ref.set({
-          pushSubscriptions: alive,
+          pushSubscriptions: result.alive,
           lastBroadcastPushId: broadcast.id,
           updatedAt: FieldValue.serverTimestamp()
         }, { merge: true });
       }));
     }
+
     lastBroadcastProcessedId = broadcast.id;
+    await db.collection('broadcasts').doc('global').set({
+      pushStats: stats,
+      pushedAt: FieldValue.serverTimestamp(),
+      pushError: FieldValue.delete(),
+      pushFailedAt: FieldValue.delete()
+    }, { merge: true });
+    return stats;
   } finally {
     broadcastRunning = false;
   }

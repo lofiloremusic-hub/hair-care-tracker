@@ -17,7 +17,7 @@
     "firebase-admin": "^12.7.0",
     "luxon": "^3.5.0",
     "openai": "^4.68.1",
+    "stripe": "^22.1.1",
     "web-push": "^3.6.7"
   }
 }
-

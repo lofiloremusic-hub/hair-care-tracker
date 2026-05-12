@@ -735,7 +735,8 @@ app.post('/api/admin/broadcast', async function(req, res) {
   const auth = await requireAdminAuth(req, res);
   if (!auth) return;
 
-  const body = sanitizeMessageText((req.body || {}).body, 100);
+  const requestBody = req.body || {};
+  const body = sanitizeMessageText(requestBody.body || requestBody.message, 100);
   const clear = (req.body || {}).clear === true;
 
   try {
@@ -1034,9 +1035,20 @@ async function processBroadcasts(force) {
     if (!broadcast.id || !broadcast.body) return;
     if (!force && broadcast.id === lastBroadcastProcessedId) return;
 
-    const usersSnap = await db.collection('users').where('notificationsEnabled', '==', true).get();
-    for (let i = 0; i < usersSnap.docs.length; i += BROADCAST_BATCH_SIZE) {
-      const batch = usersSnap.docs.slice(i, i + BROADCAST_BATCH_SIZE);
+    let cursor = null;
+    let moreUsers = true;
+    while (moreUsers) {
+      let query = db.collection('users')
+        .where('notificationsEnabled', '==', true)
+        .orderBy(FieldPath.documentId())
+        .limit(BROADCAST_BATCH_SIZE);
+      if (cursor) query = query.startAfter(cursor);
+      const usersSnap = await query.get();
+      const batch = usersSnap.docs;
+      moreUsers = usersSnap.size === BROADCAST_BATCH_SIZE;
+      cursor = batch.length ? batch[batch.length - 1] : null;
+      if (!batch.length) break;
+
       await Promise.all(batch.map(async (userDocSnap) => {
         const userDoc = userDocSnap.data() || {};
         const subscriptions = uniqueByEndpoint(userDoc.pushSubscriptions || []);

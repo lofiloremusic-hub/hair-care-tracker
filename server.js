@@ -536,9 +536,9 @@ function publicUserSummary(docSnap) {
     subscriptionPlan: user.subscriptionPlan || '',
     notificationsEnabled: user.notificationsEnabled === true,
     timezone: user.timezone || '',
-    createdAt: user.createdAt || null,
-    lastLoginAt: user.lastLoginAt || null,
-    updatedAt: user.updatedAt || null
+    createdAt: safeTimestamp(user.createdAt),
+    lastLoginAt: safeTimestamp(user.lastLoginAt),
+    updatedAt: safeTimestamp(user.updatedAt)
   };
 }
 

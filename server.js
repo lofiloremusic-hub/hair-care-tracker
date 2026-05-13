@@ -759,6 +759,8 @@ app.post('/api/stripe/create-checkout-session', async function(req, res) {
   if (!stripeReady(res, true)) return;
 
   try {
+    const requestBody = req.body || {};
+    const wantsTrial = requestBody.trial !== false && requestBody.skipTrial !== true && requestBody.checkoutMode !== 'direct';
     const userRef = db.collection('users').doc(auth.uid);
     const userSnap = await userRef.get();
     const userDoc = userSnap.exists ? (userSnap.data() || {}) : {};
@@ -776,6 +778,15 @@ app.post('/api/stripe/create-checkout-session', async function(req, res) {
       return res.json({ ok: true, alreadyPremium: true });
     }
 
+    const subscriptionData = {
+      metadata: {
+        uid: auth.uid,
+        app: 'jordyn-haircare',
+        checkoutMode: wantsTrial ? 'trial' : 'direct'
+      }
+    };
+    if (wantsTrial && STRIPE_TRIAL_DAYS > 0) subscriptionData.trial_period_days = STRIPE_TRIAL_DAYS;
+
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       customer: customerId,
@@ -784,17 +795,12 @@ app.post('/api/stripe/create-checkout-session', async function(req, res) {
       allow_promotion_codes: true,
       success_url: addQueryParam(addQueryParam(STRIPE_SUCCESS_URL, 'stripe', 'success'), 'session_id', '{CHECKOUT_SESSION_ID}'),
       cancel_url: addQueryParam(STRIPE_CANCEL_URL, 'stripe', 'cancel'),
-      subscription_data: {
-        trial_period_days: STRIPE_TRIAL_DAYS,
-        metadata: {
-          uid: auth.uid,
-          app: 'jordyn-haircare'
-        }
-      },
+      subscription_data: subscriptionData,
       metadata: {
         uid: auth.uid,
         app: 'jordyn-haircare',
-        product: 'premium'
+        product: 'premium',
+        checkoutMode: wantsTrial ? 'trial' : 'direct'
       }
     });
 
@@ -804,7 +810,7 @@ app.post('/api/stripe/create-checkout-session', async function(req, res) {
       updatedAt: FieldValue.serverTimestamp()
     }, { merge: true });
 
-    res.json({ ok: true, url: session.url, sessionId: session.id, trialDays: STRIPE_TRIAL_DAYS });
+    res.json({ ok: true, url: session.url, sessionId: session.id, trialDays: wantsTrial ? STRIPE_TRIAL_DAYS : 0, checkoutMode: wantsTrial ? 'trial' : 'direct' });
   } catch (err) {
     console.error('Stripe checkout failed:', err.message);
     jsonError(res, 500, 'stripe_checkout_failed', 'Could not open secure checkout. Try again.');

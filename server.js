@@ -364,6 +364,10 @@ async function requireAdminAuth(req, res) {
   return null;
 }
 
+function hasPremiumAccess(userDoc) {
+  return !!(userDoc && (userDoc.isAdmin === true || userDoc.isPremium === true));
+}
+
 function sanitizeMessageText(value, maxLength) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
 }
@@ -1284,21 +1288,24 @@ async function processScheduledNotifications() {
     const userDataSnap = await db.collection('userData').doc(uid).get();
     const userData = userDataSnap.exists ? (userDataSnap.data() || {}) : {};
     const notificationMeta = pruneNotificationMeta(userDoc.notificationMeta || {}, nowUtc.toMillis());
+    const premiumAccess = hasPremiumAccess(userDoc);
     let changed = false;
 
-    for (const slot of SMART_NOTIFICATION_SLOTS) {
-      const dueMoment = findDueLocalMomentForClock(slot.hour, slot.minute, localWindowStart, localNow);
-      if (!dueMoment) continue;
-      const logKey = `${dueMoment.toFormat('yyyy-LL-dd')}:${slot.key}`;
-      if (notificationMeta[logKey]) continue;
+    if (premiumAccess) {
+      for (const slot of SMART_NOTIFICATION_SLOTS) {
+        const dueMoment = findDueLocalMomentForClock(slot.hour, slot.minute, localWindowStart, localNow);
+        if (!dueMoment) continue;
+        const logKey = `${dueMoment.toFormat('yyyy-LL-dd')}:${slot.key}`;
+        if (notificationMeta[logKey]) continue;
 
-      const payload = buildSmartNotification(slot.key, userDoc, userData);
-      subscriptions = await sendToSubscriptions(subscriptions, payload);
-      notificationMeta[logKey] = Date.now();
-      changed = true;
+        const payload = buildSmartNotification(slot.key, userDoc, userData);
+        subscriptions = await sendToSubscriptions(subscriptions, payload);
+        notificationMeta[logKey] = Date.now();
+        changed = true;
+      }
     }
 
-    const reminders = (userData.reminders || []).filter((item) => item && item.enabled !== false);
+    const reminders = (userData.reminders || []).filter((item) => item && item.enabled !== false && (premiumAccess || item.smart !== true));
     for (const reminder of reminders) {
       const dueMoment = findDueReminderMoment(reminder, localWindowStart, localNow);
       if (!dueMoment) continue;

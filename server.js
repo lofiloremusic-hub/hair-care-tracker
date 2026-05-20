@@ -94,6 +94,10 @@ const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 const STRIPE_PRICE_PREMIUM_MONTHLY = process.env.STRIPE_PRICE_PREMIUM_MONTHLY || process.env.STRIPE_PREMIUM_PRICE_ID || '';
 const STRIPE_PRICE_PREMIUM_YEARLY = process.env.STRIPE_PRICE_PREMIUM_YEARLY || process.env.STRIPE_PREMIUM_YEARLY_PRICE_ID || '';
+const STRIPE_CURRENCY = (process.env.STRIPE_CURRENCY || 'usd').toLowerCase();
+const STRIPE_PRODUCT_NAME = process.env.STRIPE_PRODUCT_NAME || 'Hair Journal Tracker Premium';
+const STRIPE_PREMIUM_MONTHLY_CENTS = Math.max(100, parseInt(process.env.STRIPE_PREMIUM_MONTHLY_CENTS || '1000', 10) || 1000);
+const STRIPE_PREMIUM_YEARLY_CENTS = Math.max(100, parseInt(process.env.STRIPE_PREMIUM_YEARLY_CENTS || '9500', 10) || 9500);
 const STRIPE_TRIAL_DAYS = Math.max(0, Math.min(60, parseInt(process.env.STRIPE_TRIAL_DAYS || '14', 10) || 14));
 const STRIPE_SUCCESS_URL = (process.env.STRIPE_SUCCESS_URL || 'https://jordyn-haircare.web.app/#open-page=Premium').trim();
 const STRIPE_CANCEL_URL = (process.env.STRIPE_CANCEL_URL || 'https://jordyn-haircare.web.app/#open-page=Premium').trim();
@@ -386,16 +390,33 @@ function stripeUnixToDate(value) {
   return n > 0 ? new Date(n * 1000) : null;
 }
 
-function stripeReady(res, needsPrice) {
+function stripeReady(res) {
   if (!stripe) {
     jsonError(res, 503, 'stripe_not_configured', 'Stripe is not configured yet.');
     return false;
   }
-  if (needsPrice && !STRIPE_PRICE_PREMIUM_MONTHLY && !STRIPE_PRICE_PREMIUM_YEARLY) {
-    jsonError(res, 503, 'stripe_price_missing', 'Premium price is not configured yet.');
-    return false;
-  }
   return true;
+}
+
+function getStripeLineItemForPlan(plan) {
+  const isYearly = plan === 'yearly';
+  const configuredPrice = isYearly ? STRIPE_PRICE_PREMIUM_YEARLY : STRIPE_PRICE_PREMIUM_MONTHLY;
+  if (configuredPrice) return { price: configuredPrice, quantity: 1 };
+
+  return {
+    quantity: 1,
+    price_data: {
+      currency: STRIPE_CURRENCY,
+      unit_amount: isYearly ? STRIPE_PREMIUM_YEARLY_CENTS : STRIPE_PREMIUM_MONTHLY_CENTS,
+      recurring: { interval: isYearly ? 'year' : 'month' },
+      product_data: {
+        name: STRIPE_PRODUCT_NAME,
+        description: isYearly
+          ? 'Annual premium hair journal subscription'
+          : 'Monthly premium hair journal subscription'
+      }
+    }
+  };
 }
 
 function addQueryParam(url, key, value) {
@@ -761,23 +782,13 @@ app.get('/api/push/public-key', function(req, res) {
 app.post('/api/stripe/create-checkout-session', async function(req, res) {
   const auth = await requireFirebaseAuth(req, res);
   if (!auth) return;
-  if (!stripeReady(res, true)) return;
+  if (!stripeReady(res)) return;
 
   try {
     const requestBody = req.body || {};
     const wantsTrial = requestBody.trial !== false && requestBody.skipTrial !== true && requestBody.checkoutMode !== 'direct';
     const selectedPlan = String(requestBody.plan || 'monthly').toLowerCase() === 'yearly' ? 'yearly' : 'monthly';
-    const selectedPrice = selectedPlan === 'yearly' ? STRIPE_PRICE_PREMIUM_YEARLY : STRIPE_PRICE_PREMIUM_MONTHLY;
-    if (!selectedPrice) {
-      return jsonError(
-        res,
-        503,
-        'stripe_price_missing',
-        selectedPlan === 'yearly'
-          ? 'Premium yearly price is not configured yet.'
-          : 'Premium monthly price is not configured yet.'
-      );
-    }
+    const lineItem = getStripeLineItemForPlan(selectedPlan);
     const userRef = db.collection('users').doc(auth.uid);
     const userSnap = await userRef.get();
     const userDoc = userSnap.exists ? (userSnap.data() || {}) : {};
@@ -809,7 +820,7 @@ app.post('/api/stripe/create-checkout-session', async function(req, res) {
       mode: 'subscription',
       customer: customerId,
       client_reference_id: auth.uid,
-      line_items: [{ price: selectedPrice, quantity: 1 }],
+      line_items: [lineItem],
       allow_promotion_codes: true,
       success_url: addQueryParam(addQueryParam(STRIPE_SUCCESS_URL, 'stripe', 'success'), 'session_id', '{CHECKOUT_SESSION_ID}'),
       cancel_url: addQueryParam(STRIPE_CANCEL_URL, 'stripe', 'cancel'),
@@ -839,7 +850,7 @@ app.post('/api/stripe/create-checkout-session', async function(req, res) {
 app.post('/api/stripe/create-portal-session', async function(req, res) {
   const auth = await requireFirebaseAuth(req, res);
   if (!auth) return;
-  if (!stripeReady(res, false)) return;
+  if (!stripeReady(res)) return;
 
   try {
     const userSnap = await db.collection('users').doc(auth.uid).get();

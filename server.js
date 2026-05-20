@@ -80,7 +80,7 @@ const SMART_NOTIFICATION_SLOTS = [
 
 const AI_LIMITS = {
   advancedPerDay: 30,
-  freePerMonth: 30
+  freePerMonth: 20
 };
 
 const MAX_AI_HISTORY_ITEMS = 12;
@@ -93,6 +93,7 @@ const ADMIN_EMAILS = new Set(['iamkaransingh0709@gmail.com', 'jordynjada03@gmail
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 const STRIPE_PRICE_PREMIUM_MONTHLY = process.env.STRIPE_PRICE_PREMIUM_MONTHLY || process.env.STRIPE_PREMIUM_PRICE_ID || '';
+const STRIPE_PRICE_PREMIUM_YEARLY = process.env.STRIPE_PRICE_PREMIUM_YEARLY || process.env.STRIPE_PREMIUM_YEARLY_PRICE_ID || '';
 const STRIPE_TRIAL_DAYS = Math.max(0, Math.min(60, parseInt(process.env.STRIPE_TRIAL_DAYS || '14', 10) || 14));
 const STRIPE_SUCCESS_URL = (process.env.STRIPE_SUCCESS_URL || 'https://jordyn-haircare.web.app/#open-page=Premium').trim();
 const STRIPE_CANCEL_URL = (process.env.STRIPE_CANCEL_URL || 'https://jordyn-haircare.web.app/#open-page=Premium').trim();
@@ -390,7 +391,7 @@ function stripeReady(res, needsPrice) {
     jsonError(res, 503, 'stripe_not_configured', 'Stripe is not configured yet.');
     return false;
   }
-  if (needsPrice && !STRIPE_PRICE_PREMIUM_MONTHLY) {
+  if (needsPrice && !STRIPE_PRICE_PREMIUM_MONTHLY && !STRIPE_PRICE_PREMIUM_YEARLY) {
     jsonError(res, 503, 'stripe_price_missing', 'Premium price is not configured yet.');
     return false;
   }
@@ -765,6 +766,18 @@ app.post('/api/stripe/create-checkout-session', async function(req, res) {
   try {
     const requestBody = req.body || {};
     const wantsTrial = requestBody.trial !== false && requestBody.skipTrial !== true && requestBody.checkoutMode !== 'direct';
+    const selectedPlan = String(requestBody.plan || 'monthly').toLowerCase() === 'yearly' ? 'yearly' : 'monthly';
+    const selectedPrice = selectedPlan === 'yearly' ? STRIPE_PRICE_PREMIUM_YEARLY : STRIPE_PRICE_PREMIUM_MONTHLY;
+    if (!selectedPrice) {
+      return jsonError(
+        res,
+        503,
+        'stripe_price_missing',
+        selectedPlan === 'yearly'
+          ? 'Premium yearly price is not configured yet.'
+          : 'Premium monthly price is not configured yet.'
+      );
+    }
     const userRef = db.collection('users').doc(auth.uid);
     const userSnap = await userRef.get();
     const userDoc = userSnap.exists ? (userSnap.data() || {}) : {};
@@ -786,7 +799,8 @@ app.post('/api/stripe/create-checkout-session', async function(req, res) {
       metadata: {
         uid: auth.uid,
         app: 'jordyn-haircare',
-        checkoutMode: wantsTrial ? 'trial' : 'direct'
+        checkoutMode: wantsTrial ? 'trial' : 'direct',
+        billingPlan: selectedPlan
       }
     };
     if (wantsTrial && STRIPE_TRIAL_DAYS > 0) subscriptionData.trial_period_days = STRIPE_TRIAL_DAYS;
@@ -795,7 +809,7 @@ app.post('/api/stripe/create-checkout-session', async function(req, res) {
       mode: 'subscription',
       customer: customerId,
       client_reference_id: auth.uid,
-      line_items: [{ price: STRIPE_PRICE_PREMIUM_MONTHLY, quantity: 1 }],
+      line_items: [{ price: selectedPrice, quantity: 1 }],
       allow_promotion_codes: true,
       success_url: addQueryParam(addQueryParam(STRIPE_SUCCESS_URL, 'stripe', 'success'), 'session_id', '{CHECKOUT_SESSION_ID}'),
       cancel_url: addQueryParam(STRIPE_CANCEL_URL, 'stripe', 'cancel'),
@@ -804,7 +818,8 @@ app.post('/api/stripe/create-checkout-session', async function(req, res) {
         uid: auth.uid,
         app: 'jordyn-haircare',
         product: 'premium',
-        checkoutMode: wantsTrial ? 'trial' : 'direct'
+        checkoutMode: wantsTrial ? 'trial' : 'direct',
+        billingPlan: selectedPlan
       }
     });
 
@@ -814,7 +829,7 @@ app.post('/api/stripe/create-checkout-session', async function(req, res) {
       updatedAt: FieldValue.serverTimestamp()
     }, { merge: true });
 
-    res.json({ ok: true, url: session.url, sessionId: session.id, trialDays: wantsTrial ? STRIPE_TRIAL_DAYS : 0, checkoutMode: wantsTrial ? 'trial' : 'direct' });
+    res.json({ ok: true, url: session.url, sessionId: session.id, trialDays: wantsTrial ? STRIPE_TRIAL_DAYS : 0, checkoutMode: wantsTrial ? 'trial' : 'direct', plan: selectedPlan });
   } catch (err) {
     console.error('Stripe checkout failed:', err.message);
     jsonError(res, 500, 'stripe_checkout_failed', 'Could not open secure checkout. Try again.');
@@ -842,6 +857,36 @@ app.post('/api/stripe/create-portal-session', async function(req, res) {
   } catch (err) {
     console.error('Stripe portal failed:', err.message);
     jsonError(res, 500, 'stripe_portal_failed', 'Could not open billing portal. Try again.');
+  }
+});
+
+app.post('/api/feedback', async function(req, res) {
+  const auth = await requireFirebaseAuth(req, res);
+  if (!auth) return;
+
+  try {
+    const body = req.body || {};
+    const message = sanitizeMessageText(body.message, 1400);
+    const category = sanitizeMessageText(body.category || 'general', 80) || 'general';
+    const source = sanitizeMessageText(body.source || 'app', 80) || 'app';
+    if (!message) return jsonError(res, 400, 'missing_feedback', 'Please write your feedback first.');
+
+    await db.collection('feedback').add({
+      uid: auth.uid,
+      email: auth.email || '',
+      displayName: auth.name || '',
+      category,
+      source,
+      message,
+      userAgent: sanitizeMessageText(req.headers['user-agent'] || '', 300),
+      createdAt: FieldValue.serverTimestamp(),
+      status: 'new'
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Feedback save failed:', err.message);
+    jsonError(res, 500, 'feedback_failed', 'Could not send feedback right now.');
   }
 });
 
@@ -1227,7 +1272,7 @@ app.post('/api/chat', async function(req, res) {
   if (!quota.allowed) {
     return jsonError(res, 429, 'quota_exceeded', quota.isAdvanced
       ? 'You have used all 30 Advanced AI messages for today.'
-      : 'You have used all 30 free AI messages for this month.', {
+      : 'You have used all 20 free AI messages for this month.', {
       quota: formatQuotaResponse(quota)
     });
   }

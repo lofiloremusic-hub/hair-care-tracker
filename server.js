@@ -84,7 +84,7 @@ const AI_LIMITS = {
 };
 
 const MAX_AI_HISTORY_ITEMS = 12;
-const AI_REQUEST_TIMEOUT_MS = Math.max(20000, Math.min(120000, parseInt(process.env.AI_REQUEST_TIMEOUT_MS || '70000', 10) || 70000));
+const AI_REQUEST_TIMEOUT_MS = Math.max(15000, Math.min(60000, parseInt(process.env.AI_REQUEST_TIMEOUT_MS || '35000', 10) || 35000));
 const AI_RETRY_DELAY_MS = Math.max(300, Math.min(5000, parseInt(process.env.AI_RETRY_DELAY_MS || '900', 10) || 900));
 const SCHEDULE_CATCHUP_MINUTES = Math.max(12, parseInt(process.env.SCHEDULE_CATCHUP_MINUTES || '24', 10) || 24);
 const SCHEDULE_SWEEP_LIMIT = Math.max(50, Math.min(500, parseInt(process.env.SCHEDULE_SWEEP_LIMIT || '250', 10) || 250));
@@ -117,8 +117,8 @@ function parseAIModels(value, fallback) {
 }
 
 const AI_MODELS = {
-  advanced: parseAIModels(process.env.AI_ADVANCED_MODELS || process.env.AI_MODEL_ADVANCED, ['openrouter/auto']),
-  standard: parseAIModels(process.env.AI_STANDARD_MODELS || process.env.AI_MODEL_STANDARD || process.env.AI_MODEL_FREE, ['openrouter/auto'])
+  advanced: parseAIModels(process.env.AI_ADVANCED_MODELS || process.env.AI_MODEL_ADVANCED, ['openai/gpt-4o-mini', 'google/gemini-2.0-flash-001', 'openrouter/auto']),
+  standard: parseAIModels(process.env.AI_STANDARD_MODELS || process.env.AI_MODEL_STANDARD || process.env.AI_MODEL_FREE, ['openai/gpt-4o-mini', 'google/gemini-2.0-flash-001', 'openrouter/auto'])
 };
 
 let lastScheduleSweepAt = 0;
@@ -665,12 +665,17 @@ function extractAIReply(response) {
   return '';
 }
 
+function isUnhelpfulAIRefusal(reply) {
+  const normalized = String(reply || '').toLowerCase();
+  return /\b(i(?:'|’)?m sorry|i am sorry|cannot assist|can't assist|unable to assist|cannot help|can't help|not able to help)\b/.test(normalized);
+}
+
 async function createAICompletionWithFallback(messages, isAdvanced) {
   const models = isAdvanced ? AI_MODELS.advanced : AI_MODELS.standard;
   let lastErr = null;
 
   for (const model of models) {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt < 1; attempt += 1) {
       try {
         const response = await openai.chat.completions.create({
           model,
@@ -686,11 +691,16 @@ async function createAICompletionWithFallback(messages, isAdvanced) {
           emptyErr.status = 502;
           throw emptyErr;
         }
+        if (isUnhelpfulAIRefusal(reply)) {
+          const refusalErr = new Error('AI model refused a safe user question.');
+          refusalErr.status = 502;
+          throw refusalErr;
+        }
         return { response, model, reply };
       } catch (err) {
         lastErr = err;
         console.warn('AI model attempt failed:', model, 'attempt', attempt + 1, (err && err.message) || err);
-        if (!isRetryableAIError(err) || attempt === 1) break;
+        if (!isRetryableAIError(err) || attempt === 0) break;
         await wait(AI_RETRY_DELAY_MS * (attempt + 1));
       }
     }
@@ -1365,8 +1375,10 @@ app.post('/api/chat', async function(req, res) {
     quota.isAdvanced
       ? 'Advanced mode: be highly personal, specific, and premium-feeling. Use the user profile, logs, products, goals, and recent signals when present.'
       : 'Free mode: be warm and useful, but keep it shorter. Do not mention advanced-only audits or tell the user they are premium.',
-    'Answer the exact user question first, like ChatGPT would: direct, accurate, and natural. Do not force every answer into the same routine/product template.',
-    'Use the smallest useful structure. If the user asks one direct thing, give one direct answer with only the sections that help that exact thing.',
+    'Primary rule: answer exactly what the user asked in a simple ChatGPT-like way. Be direct first, then add only the useful extra details.',
+    'Do not force every answer into Diagnosis, Routine, Product Picks, or Next Move. Choose labels from the question itself, or use no labels for a simple answer.',
+    'Safe hair/scalp/cosmetic questions are allowed and must be answered: dandruff, flakes, itchy scalp, dry scalp, shampoo, conditioner, oil, steam, protein treatment, shedding, breakage, frizz, growth, product choice, brand choice, routine doubts, and emotional frustration about hair.',
+    'Never refuse safe hair/scalp/cosmetic guidance. If there are medical red flags, give safe general guidance and recommend a dermatologist, but still answer the harmless part.',
     'If the user asks which company, brand, shampoo, oil, product, mask, or treatment to use, give named picks or exact selection criteria first before any routine advice.',
     'For purchase questions like "what shampoo should I buy" or "which company dandruff shampoo", do not use Diagnosis, Routine, Product Picks, or Next Move. Use Direct Pick:, Good Options:, How To Use:, Avoid: only if needed, and name actual options.',
     'Never ignore the object in the question. If they ask dandruff shampoo, answer dandruff shampoo. If they ask steam, answer steam. If they ask stress, answer stress.',

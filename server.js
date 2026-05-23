@@ -642,6 +642,20 @@ function isRetryableAIError(err) {
     || msg.includes('temporarily');
 }
 
+function extractAIReply(response) {
+  const choice = response && Array.isArray(response.choices) ? response.choices[0] : null;
+  const message = choice && choice.message ? choice.message : {};
+  if (typeof message.content === 'string') return sanitizeMessageText(message.content, 6000);
+  if (Array.isArray(message.content)) {
+    return sanitizeMessageText(message.content.map((part) => {
+      if (!part) return '';
+      if (typeof part === 'string') return part;
+      return part.text || part.content || '';
+    }).join(' '), 6000);
+  }
+  return '';
+}
+
 async function createAICompletionWithFallback(messages, isAdvanced) {
   const models = isAdvanced ? AI_MODELS.advanced : AI_MODELS.standard;
   let lastErr = null;
@@ -657,7 +671,13 @@ async function createAICompletionWithFallback(messages, isAdvanced) {
         }, {
           timeout: AI_REQUEST_TIMEOUT_MS
         });
-        return { response, model };
+        const reply = extractAIReply(response);
+        if (!reply) {
+          const emptyErr = new Error('AI model returned an empty reply.');
+          emptyErr.status = 502;
+          throw emptyErr;
+        }
+        return { response, model, reply };
       } catch (err) {
         lastErr = err;
         console.warn('AI model attempt failed:', model, 'attempt', attempt + 1, (err && err.message) || err);
@@ -1359,9 +1379,8 @@ app.post('/api/chat', async function(req, res) {
 
   try {
     const completion = await createAICompletionWithFallback(messages, quota.isAdvanced);
-    const response = completion.response;
     res.json({
-      reply: response.choices[0].message.content,
+      reply: completion.reply,
       quota: formatQuotaResponse(quota),
       tier: quota.isAdvanced ? 'advanced' : 'standard',
       model: completion.model,

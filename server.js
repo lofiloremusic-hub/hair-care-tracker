@@ -105,9 +105,9 @@ const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
 function parseAIModels(value, fallback) {
   const seen = new Set();
-  return String(value || '')
-    .split(',')
+  return []
     .concat(fallback || [])
+    .concat(String(value || '').split(','))
     .map((model) => String(model || '').trim())
     .filter((model) => {
       if (!model || seen.has(model)) return false;
@@ -1379,7 +1379,8 @@ app.post('/api/chat', async function(req, res) {
     'Do not force every answer into Diagnosis, Routine, Product Picks, or Next Move. Choose labels from the question itself, or use no labels for a simple answer.',
     'Safe hair/scalp/cosmetic questions are allowed and must be answered: dandruff, flakes, itchy scalp, dry scalp, shampoo, conditioner, oil, steam, protein treatment, shedding, breakage, frizz, growth, product choice, brand choice, routine doubts, and emotional frustration about hair.',
     'Never refuse safe hair/scalp/cosmetic guidance. If there are medical red flags, give safe general guidance and recommend a dermatologist, but still answer the harmless part.',
-    'If the user asks which company, brand, shampoo, oil, product, mask, or treatment to use, give named picks or exact selection criteria first before any routine advice.',
+	    'If the user asks which company, brand, shampoo, oil, product, mask, or treatment to use, give named picks or exact selection criteria first before any routine advice.',
+	    'For direct product questions, name 3-5 real options when possible, then say which one to pick first. Do not hide behind generic advice.',
     'For purchase questions like "what shampoo should I buy" or "which company dandruff shampoo", do not use Diagnosis, Routine, Product Picks, or Next Move. Use Direct Pick:, Good Options:, How To Use:, Avoid: only if needed, and name actual options.',
     'Never ignore the object in the question. If they ask dandruff shampoo, answer dandruff shampoo. If they ask steam, answer steam. If they ask stress, answer stress.',
     'Do not title every answer Personalized Hair Plan or Wash Day Routine. The response title and section labels must match the exact user ask.',
@@ -1393,10 +1394,14 @@ app.post('/api/chat', async function(req, res) {
   ].join(' ');
 
   const messages = [{ role: 'system', content: responseContract }];
-  sanitizeAIHistory(history).forEach((m) => {
-    messages.push(m);
-  });
-  messages.push({ role: 'user', content: safeMessage });
+	  sanitizeAIHistory(history).forEach((m) => {
+	    messages.push(m);
+	  });
+	  messages.push({
+	    role: 'system',
+	    content: 'The next user message is the current task. Answer that exact question directly. Do not repeat a previous topic, previous product, or generic routine unless the user asks for it.'
+	  });
+	  messages.push({ role: 'user', content: safeMessage });
 
   try {
     const completion = await createAICompletionWithFallback(messages, quota.isAdvanced);

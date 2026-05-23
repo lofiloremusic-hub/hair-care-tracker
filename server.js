@@ -396,6 +396,15 @@ function sanitizeMessageText(value, maxLength) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
 }
 
+function sanitizeAIReplyText(value, maxLength) {
+  return String(value || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{4,}/g, '\n\n\n')
+    .trim()
+    .slice(0, maxLength);
+}
+
 function compactDefined(value) {
   const out = {};
   Object.keys(value || {}).forEach((key) => {
@@ -645,13 +654,13 @@ function isRetryableAIError(err) {
 function extractAIReply(response) {
   const choice = response && Array.isArray(response.choices) ? response.choices[0] : null;
   const message = choice && choice.message ? choice.message : {};
-  if (typeof message.content === 'string') return sanitizeMessageText(message.content, 6000);
+  if (typeof message.content === 'string') return sanitizeAIReplyText(message.content, 6000);
   if (Array.isArray(message.content)) {
-    return sanitizeMessageText(message.content.map((part) => {
+    return sanitizeAIReplyText(message.content.map((part) => {
       if (!part) return '';
       if (typeof part === 'string') return part;
       return part.text || part.content || '';
-    }).join(' '), 6000);
+    }).join('\n'), 6000);
   }
   return '';
 }

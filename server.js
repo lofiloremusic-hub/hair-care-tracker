@@ -126,6 +126,7 @@ let scheduleCursorId = '';
 let scheduleRunning = false;
 let broadcastRunning = false;
 let lastBroadcastProcessedId = '';
+const MAX_PUSH_SUBSCRIPTIONS_PER_USER = Math.max(1, Math.min(5, parseInt(process.env.MAX_PUSH_SUBSCRIPTIONS_PER_USER || '1', 10) || 1));
 
 const REMINDER_TYPE_EMOJI = {
   wash: '🧼',
@@ -138,9 +139,9 @@ const REMINDER_TYPE_EMOJI = {
   custom: '🔔'
 };
 
-function cleanSubscription(subscription) {
+function cleanSubscription(subscription, meta) {
   if (!subscription || !subscription.endpoint || !subscription.keys) return null;
-  return {
+  const cleaned = {
     endpoint: subscription.endpoint,
     expirationTime: subscription.expirationTime || null,
     keys: {
@@ -148,6 +149,10 @@ function cleanSubscription(subscription) {
       auth: subscription.keys.auth
     }
   };
+  if (meta && meta.clientDeviceId) cleaned.clientDeviceId = String(meta.clientDeviceId).slice(0, 80);
+  if (meta && meta.userAgent) cleaned.userAgent = String(meta.userAgent).slice(0, 180);
+  cleaned.updatedAtMs = Date.now();
+  return cleaned;
 }
 
 function getTodayKey(zone) {
@@ -208,7 +213,7 @@ function buildReminderNotification(reminder, userDoc, userData) {
   const emoji = REMINDER_TYPE_EMOJI[reminder.type] || '🔔';
   return {
     title: `${emoji} ${reminder.title} for ${name}`,
-    body: 'Your scheduled hair reminder is ready. Tap to open Jordyn and stay consistent.',
+    body: 'Your scheduled hair reminder is ready. Tap to open Hair Journal and stay consistent.',
     tag: `jhb-rem-${reminder.id}`,
     data: { page: 'Calendar', url: '/#open-page=Calendar', reminderId: reminder.id }
   };
@@ -244,7 +249,8 @@ function buildSmartNotification(slotKey, userDoc, userData) {
 
 async function sendToSubscriptions(subscriptions, payload) {
   const alive = [];
-  for (const sub of subscriptions || []) {
+  const targets = prunePushSubscriptions(subscriptions || []);
+  for (const sub of targets) {
     try {
       await webpush.sendNotification(sub, JSON.stringify(payload));
       alive.push(sub);
@@ -264,7 +270,8 @@ async function sendToSubscriptionsWithStats(subscriptions, payload) {
     removed: 0
   };
 
-  for (const sub of subscriptions || []) {
+  const targets = prunePushSubscriptions(subscriptions || []);
+  for (const sub of targets) {
     try {
       await webpush.sendNotification(sub, JSON.stringify(payload));
       stats.sent += 1;
@@ -291,6 +298,18 @@ function uniqueByEndpoint(list) {
     seen.add(sub.endpoint);
     return true;
   });
+}
+
+function getPushSubscriptionCount(userDoc) {
+  const stored = Number((userDoc || {}).pushSubscriptionCount || 0) || 0;
+  const live = uniqueByEndpoint((userDoc || {}).pushSubscriptions || []).length;
+  return Math.max(stored, live);
+}
+
+function prunePushSubscriptions(list) {
+  const unique = uniqueByEndpoint(list || []);
+  unique.sort((a, b) => Number(a.updatedAtMs || 0) - Number(b.updatedAtMs || 0));
+  return unique.slice(Math.max(0, unique.length - MAX_PUSH_SUBSCRIPTIONS_PER_USER));
 }
 
 function jsonError(res, status, code, message, extra) {
@@ -596,10 +615,16 @@ async function handleStripeWebhook(req, res) {
 
 function sanitizeAIHistory(history) {
   if (!Array.isArray(history)) return [];
-  return history.slice(-MAX_AI_HISTORY_ITEMS).map((item) => ({
-    role: item && item.role === 'ai' ? 'assistant' : 'user',
-    content: sanitizeMessageText(item && item.text, 1200)
-  })).filter((item) => item.content);
+  // Do not feed old assistant cards back into the model; that causes repeated canned templates.
+  return history
+    .slice(-MAX_AI_HISTORY_ITEMS)
+    .filter((item) => item && item.role !== 'ai')
+    .slice(-6)
+    .map((item) => ({
+      role: 'user',
+      content: sanitizeMessageText(item && item.text, 700)
+    }))
+    .filter((item) => item.content);
 }
 
 function wait(ms) {
@@ -921,6 +946,7 @@ function publicUserSummary(docSnap) {
     isPremium: user.isPremium === true,
     subscriptionPlan: user.subscriptionPlan || '',
     notificationsEnabled: user.notificationsEnabled === true,
+    pushSubscriptionCount: getPushSubscriptionCount(user),
     timezone: user.timezone || '',
     createdAt: safeTimestamp(user.createdAt),
     lastLoginAt: safeTimestamp(user.lastLoginAt),
@@ -1052,14 +1078,22 @@ app.get('/api/admin/users', async function(req, res) {
       total: users.length + (nextPageToken ? '+' : ''),
       premium: null,
       admins,
-      trial: null
+      trial: null,
+      notificationsOn: null,
+      pushReady: null
     };
 
     if (includeStats) {
-      const total = await safeCount(db.collection('users'));
-      const premium = await safeCount(db.collection('users').where('isPremium', '==', true));
+      const [total, premium, notificationsOn, pushReady] = await Promise.all([
+        safeCount(db.collection('users')),
+        safeCount(db.collection('users').where('isPremium', '==', true)),
+        safeCount(db.collection('users').where('notificationsEnabled', '==', true)),
+        safeCount(db.collection('users').where('pushSubscriptionCount', '>', 0))
+      ]);
       stats.total = total;
       stats.premium = premium;
+      stats.notificationsOn = notificationsOn;
+      stats.pushReady = pushReady;
       stats.trial = total == null || premium == null ? null : Math.max(0, total - premium - admins);
     }
 
@@ -1211,15 +1245,22 @@ app.post('/api/push/subscribe', async function(req, res) {
   const auth = await requireFirebaseAuth(req, res);
   if (!auth) return;
 
-  const { email, displayName, timezone, notificationsEnabled, subscription } = req.body || {};
+  const { email, displayName, timezone, notificationsEnabled, subscription, clientDeviceId } = req.body || {};
   const uid = auth.uid;
 
-  const cleaned = cleanSubscription(subscription);
+  const cleaned = cleanSubscription(subscription, {
+    clientDeviceId,
+    userAgent: req.headers['user-agent'] || ''
+  });
   if (!cleaned) return jsonError(res, 400, 'invalid_subscription', 'Missing or invalid push subscription.');
   const userRef = db.collection('users').doc(uid);
   const snap = await userRef.get();
   const existing = snap.exists ? (snap.data() || {}) : {};
-  const subscriptions = uniqueByEndpoint([].concat(existing.pushSubscriptions || [], cleaned || []).filter(Boolean));
+  const existingSubscriptions = (existing.pushSubscriptions || []).filter((sub) => {
+    if (!sub || !sub.endpoint) return false;
+    return !(cleaned.clientDeviceId && sub.clientDeviceId === cleaned.clientDeviceId);
+  });
+  const subscriptions = prunePushSubscriptions([].concat(existingSubscriptions, cleaned).filter(Boolean));
 
   await userRef.set({
     uid,
@@ -1228,6 +1269,7 @@ app.post('/api/push/subscribe', async function(req, res) {
     timezone: getValidTimezone(timezone || existing.timezone),
     notificationsEnabled: notificationsEnabled !== false,
     pushSubscriptions: subscriptions,
+    pushSubscriptionCount: subscriptions.length,
     updatedAt: FieldValue.serverTimestamp()
   }, { merge: true });
 
@@ -1247,11 +1289,12 @@ app.post('/api/push/unsubscribe', async function(req, res) {
   const userRef = db.collection('users').doc(uid);
   const snap = await userRef.get();
   const existing = snap.exists ? (snap.data() || {}) : {};
-  const subscriptions = (existing.pushSubscriptions || []).filter((sub) => sub && sub.endpoint !== endpoint);
+  const subscriptions = prunePushSubscriptions((existing.pushSubscriptions || []).filter((sub) => sub && sub.endpoint !== endpoint));
 
   await userRef.set({
     notificationsEnabled: !!notificationsEnabled,
     pushSubscriptions: subscriptions,
+    pushSubscriptionCount: subscriptions.length,
     updatedAt: FieldValue.serverTimestamp()
   }, { merge: true });
 
@@ -1293,9 +1336,19 @@ app.post('/api/chat', async function(req, res) {
     quota.isAdvanced
       ? 'Advanced mode: be highly personal, specific, and premium-feeling. Use the user profile, logs, products, goals, and recent signals when present.'
       : 'Free mode: be warm and useful, but keep it shorter. Do not mention advanced-only audits or tell the user they are premium.',
-    'Format contract: reply in clean mobile-card sections only. Use these labels in this order when relevant: Diagnosis:, Today:, Routine:, Product Picks:, Next Move:.',
-    'Under each label write 1-3 short bullets. No markdown bold, no hashtags, no long essay paragraphs, no fake certainty, no "stay tuned", and no upgrade pitch unless the user explicitly asks about premium.',
-    'Tone: supportive, personal, easy to read, and lightly emoji-led. Every line should feel useful.'
+    'Answer the exact user question first, like ChatGPT would: direct, accurate, and natural. Do not force every answer into the same routine/product template.',
+    'Use the smallest useful structure. If the user asks one direct thing, give one direct answer with only the sections that help that exact thing.',
+    'If the user asks which company, brand, shampoo, oil, product, mask, or treatment to use, give named picks or exact selection criteria first before any routine advice.',
+    'For purchase questions like "what shampoo should I buy" or "which company dandruff shampoo", do not use Diagnosis, Routine, Product Picks, or Next Move. Use Direct Pick:, Good Options:, How To Use:, Avoid: only if needed, and name actual options.',
+    'Never ignore the object in the question. If they ask dandruff shampoo, answer dandruff shampoo. If they ask steam, answer steam. If they ask stress, answer stress.',
+    'Do not title every answer Personalized Hair Plan or Wash Day Routine. The response title and section labels must match the exact user ask.',
+    'Do not use old logs, goals, or products as the main answer when the user asks a specific topic like protein, steam, stress, or a simple non-hair question.',
+    'Use adaptive mobile-card sections only when useful. For simple questions use Quick Answer:, Direct Pick:, Do This:, Avoid:. For treatment questions use When To Do It:, When To Skip It:, How To Use It:. Use Diagnosis:, Routine:, Product Picks:, Next Move: only when the user asks for analysis, routine, plan, or product comparison.',
+    'If the prompt is vague or emotional, respond like a human first, then ask one sharp follow-up with options. Do not pretend certainty from old logs.',
+    'If the prompt is not about hair, answer normally and do not inject hair profile context.',
+    'Never answer a brand/product question with a generic scalp plan. Never answer a casual/emotional question with a full hair plan unless requested.',
+    'Under each label write 1-3 short bullets or one tight paragraph. No markdown bold, no hashtags, no long essay paragraphs, no fake certainty, no "stay tuned", and no upgrade pitch unless the user explicitly asks about premium.',
+    'Tone: supportive, personal, accurate, easy to read, and lightly emoji-led. Every line should feel useful.'
   ].join(' ');
 
   const messages = [{ role: 'system', content: responseContract }];
@@ -1334,7 +1387,7 @@ async function processScheduledNotifications() {
   for (const userDocSnap of usersSnap.docs) {
     const userDoc = userDocSnap.data() || {};
     const uid = userDoc.uid || userDocSnap.id;
-    let subscriptions = uniqueByEndpoint(userDoc.pushSubscriptions || []);
+    let subscriptions = prunePushSubscriptions(userDoc.pushSubscriptions || []);
     if (!subscriptions.length) continue;
 
     const zone = getValidTimezone(userDoc.timezone);
@@ -1377,6 +1430,7 @@ async function processScheduledNotifications() {
     if (changed) {
       await userDocSnap.ref.set({
         pushSubscriptions: subscriptions,
+        pushSubscriptionCount: subscriptions.length,
         notificationMeta,
         updatedAt: FieldValue.serverTimestamp()
       }, { merge: true });
@@ -1452,7 +1506,7 @@ async function processBroadcasts(force) {
       const batch = docs.slice(i, i + BROADCAST_BATCH_SIZE);
       await Promise.all(batch.map(async (userDocSnap) => {
         const userDoc = userDocSnap.data() || {};
-        const subscriptions = uniqueByEndpoint(userDoc.pushSubscriptions || []);
+        const subscriptions = prunePushSubscriptions(userDoc.pushSubscriptions || []);
         stats.usersChecked += 1;
         if (!subscriptions.length) return;
         stats.subscribedUsers += 1;
@@ -1462,7 +1516,7 @@ async function processBroadcasts(force) {
         }
 
         const payload = {
-          title: '📣 Jordyn update',
+          title: '📣 Hair Journal update',
           body: String(broadcast.body).slice(0, 100),
           tag: `jhb-broadcast-${broadcast.id}`,
           data: { page: 'Home', url: '/#open-page=Home', broadcastId: broadcast.id }
@@ -1474,6 +1528,7 @@ async function processBroadcasts(force) {
         stats.removedSubscriptions += result.stats.removed;
         await userDocSnap.ref.set({
           pushSubscriptions: result.alive,
+          pushSubscriptionCount: result.alive.length,
           lastBroadcastPushId: broadcast.id,
           updatedAt: FieldValue.serverTimestamp()
         }, { merge: true });

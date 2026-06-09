@@ -2,8 +2,6 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { OpenAI } = require('openai');
-const https = require('https');
-const http = require('http');
 const webpush = require('web-push');
 const admin = require('firebase-admin');
 const { DateTime } = require('luxon');
@@ -87,7 +85,11 @@ const MAX_AI_HISTORY_ITEMS = 12;
 const AI_REQUEST_TIMEOUT_MS = Math.max(15000, Math.min(60000, parseInt(process.env.AI_REQUEST_TIMEOUT_MS || '35000', 10) || 35000));
 const AI_RETRY_DELAY_MS = Math.max(300, Math.min(5000, parseInt(process.env.AI_RETRY_DELAY_MS || '900', 10) || 900));
 const SCHEDULE_CATCHUP_MINUTES = Math.max(12, parseInt(process.env.SCHEDULE_CATCHUP_MINUTES || '24', 10) || 24);
-const SCHEDULE_SWEEP_LIMIT = Math.max(50, Math.min(500, parseInt(process.env.SCHEDULE_SWEEP_LIMIT || '250', 10) || 250));
+const SCHEDULE_SWEEP_LIMIT = Math.max(25, Math.min(250, parseInt(process.env.SCHEDULE_SWEEP_LIMIT || '50', 10) || 50));
+const SCHEDULE_SWEEP_INTERVAL_MS = Math.max(60000, Math.min(30 * 60000, parseInt(process.env.SCHEDULE_SWEEP_INTERVAL_MS || '300000', 10) || 300000));
+const BROADCAST_POLL_INTERVAL_MS = Math.max(5 * 60000, Math.min(60 * 60000, parseInt(process.env.BROADCAST_POLL_INTERVAL_MS || '900000', 10) || 900000));
+const BACKGROUND_JOB_INITIAL_DELAY_MS = Math.max(10000, Math.min(5 * 60000, parseInt(process.env.BACKGROUND_JOB_INITIAL_DELAY_MS || '45000', 10) || 45000));
+const FIRESTORE_QUOTA_BACKOFF_MS = Math.max(5 * 60000, Math.min(6 * 60 * 60000, parseInt(process.env.FIRESTORE_QUOTA_BACKOFF_MS || '1800000', 10) || 1800000));
 const BROADCAST_BATCH_SIZE = Math.max(10, Math.min(100, parseInt(process.env.BROADCAST_BATCH_SIZE || '40', 10) || 40));
 const ADMIN_EMAILS = new Set(['iamkaransingh0709@gmail.com', 'jordynjada03@gmail.com']);
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
@@ -126,6 +128,10 @@ let scheduleCursorId = '';
 let scheduleRunning = false;
 let broadcastRunning = false;
 let lastBroadcastProcessedId = '';
+const backgroundJobState = {
+  schedule: { blockedUntil: 0, quotaFailures: 0 },
+  broadcast: { blockedUntil: 0, quotaFailures: 0 }
+};
 const MAX_PUSH_SUBSCRIPTIONS_PER_USER = Math.max(1, Math.min(5, parseInt(process.env.MAX_PUSH_SUBSCRIPTIONS_PER_USER || '1', 10) || 1));
 
 const REMINDER_TYPE_EMOJI = {
@@ -158,6 +164,67 @@ function cleanSubscription(subscription, meta) {
 function getTodayKey(zone) {
   return DateTime.now().setZone(zone || 'UTC').toFormat('yyyy-LL-dd');
 }
+
+function isFirestoreQuotaError(err) {
+  const code = Number(err && err.code);
+  const message = String((err && (err.details || err.message)) || err || '');
+  return code === 8 || /RESOURCE_EXHAUSTED|quota exceeded/i.test(message);
+}
+
+function canUseScheduleFallback(err) {
+  const code = Number(err && err.code);
+  const message = String((err && (err.details || err.message)) || err || '');
+  return code === 9 || /FAILED_PRECONDITION|requires an index/i.test(message);
+}
+
+function recordBackgroundJobFailure(name, err) {
+  const state = backgroundJobState[name];
+  if (!state || !isFirestoreQuotaError(err)) return false;
+  state.quotaFailures += 1;
+  const multiplier = Math.pow(2, Math.min(state.quotaFailures - 1, 4));
+  const delayMs = Math.min(6 * 60 * 60000, FIRESTORE_QUOTA_BACKOFF_MS * multiplier);
+  state.blockedUntil = Date.now() + delayMs;
+  console.error(
+    `${name} paused for ${Math.round(delayMs / 60000)} minutes after Firestore quota exhaustion:`,
+    err && err.message ? err.message : err
+  );
+  return true;
+}
+
+async function runBackgroundJob(name, task) {
+  const state = backgroundJobState[name];
+  if (!state || Date.now() < state.blockedUntil) return;
+  try {
+    await task();
+    state.quotaFailures = 0;
+    state.blockedUntil = 0;
+  } catch (err) {
+    if (!recordBackgroundJobFailure(name, err)) {
+      console.error(`${name} background job error:`, err && err.message ? err.message : err);
+    }
+  }
+}
+
+function startBackgroundLoop(name, intervalMs, task, initialDelayMs) {
+  const run = async () => {
+    await runBackgroundJob(name, task);
+    const nextTimer = setTimeout(run, intervalMs);
+    if (typeof nextTimer.unref === 'function') nextTimer.unref();
+  };
+  const firstTimer = setTimeout(run, initialDelayMs);
+  if (typeof firstTimer.unref === 'function') firstTimer.unref();
+}
+
+process.on('unhandledRejection', (reason) => {
+  if (isFirestoreQuotaError(reason)) {
+    console.error(
+      'Suppressed unhandled Firestore quota rejection so the server stays healthy:',
+      reason && reason.message ? reason.message : reason
+    );
+    return;
+  }
+  console.error('Unhandled promise rejection:', reason);
+});
 
 function getNotificationName(userDoc, userData) {
   const name = ((userData && userData.profile && userData.profile.name) || userDoc.displayName || 'love').trim();
@@ -836,7 +903,11 @@ app.get('/', function(req, res) {
 });
 
 app.get('/health', function(req, res) {
-  res.json({ ok: true });
+  res.json({
+    ok: true,
+    revision: String(process.env.RENDER_GIT_COMMIT || 'local').slice(0, 12),
+    uptimeSeconds: Math.floor(process.uptime())
+  });
 });
 
 app.get('/api/push/public-key', function(req, res) {
@@ -1506,7 +1577,8 @@ async function getNextScheduledUserPage() {
     scheduleCursorId = snap.size === SCHEDULE_SWEEP_LIMIT && last ? last.id : '';
     return snap;
   } catch (err) {
-    console.warn('Paginated schedule query failed, using limited fallback:', err.message);
+    if (!canUseScheduleFallback(err)) throw err;
+    console.warn('Paginated schedule query needs a fallback:', err.message);
     scheduleCursorId = '';
     return db.collection('users').where('notificationsEnabled', '==', true).limit(SCHEDULE_SWEEP_LIMIT).get();
   }
@@ -1593,22 +1665,18 @@ async function processBroadcasts(force) {
   }
 }
 
-setInterval(() => {
-  processScheduledNotifications().catch((err) => console.error('scheduled notification error', err.message));
-}, 60000);
-
-setInterval(() => {
-  processBroadcasts().catch((err) => console.error('broadcast push error', err.message));
-}, 30000);
-
-const SELF_PING_URL = (process.env.RENDER_EXTERNAL_URL || ('http://localhost:' + PORT)).replace(/\/+$/, '') + '/health';
-setInterval(() => {
-  const client = SELF_PING_URL.startsWith('https') ? https : http;
-  client.get(SELF_PING_URL, () => {}).on('error', () => {});
-}, 14 * 60 * 1000);
-
 app.listen(PORT, () => {
   console.log('Server running on ' + PORT);
-  processScheduledNotifications().catch((err) => console.error('scheduled notification startup error', err.message));
-  processBroadcasts().catch((err) => console.error('broadcast startup error', err.message));
+  startBackgroundLoop(
+    'schedule',
+    SCHEDULE_SWEEP_INTERVAL_MS,
+    processScheduledNotifications,
+    BACKGROUND_JOB_INITIAL_DELAY_MS
+  );
+  startBackgroundLoop(
+    'broadcast',
+    BROADCAST_POLL_INTERVAL_MS,
+    () => processBroadcasts(false),
+    BACKGROUND_JOB_INITIAL_DELAY_MS + 15000
+  );
 });

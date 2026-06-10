@@ -132,12 +132,14 @@ let broadcastRunning = false;
 let lastBroadcastProcessedId = '';
 const backgroundJobState = {
   schedule: { blockedUntil: 0, quotaFailures: 0 },
+  reminderSchedule: { blockedUntil: 0, quotaFailures: 0 },
   broadcast: { blockedUntil: 0, quotaFailures: 0 }
 };
 const MAX_PUSH_SUBSCRIPTIONS_PER_USER = Math.max(1, Math.min(5, parseInt(process.env.MAX_PUSH_SUBSCRIPTIONS_PER_USER || '1', 10) || 1));
 const MAX_EXACT_REMINDER_DELAY_MS = 7 * 24 * 60 * 60 * 1000;
 const registeredReminderTimers = new Map();
 const reminderDeliveryLocks = new Set();
+let durableReminderSweepRunning = false;
 
 const REMINDER_TYPE_EMOJI = {
   wash: '🧼',
@@ -427,6 +429,28 @@ function getRegisteredReminderKey(uid, reminderId) {
   return `${uid}:${reminderId}`;
 }
 
+function getReminderScheduleDocId(uid, reminderId) {
+  return crypto.createHash('sha256').update(`${uid}:${reminderId}`).digest('hex').slice(0, 48);
+}
+
+function getReminderScheduleRef(uid, reminderId) {
+  return db.collection('reminderSchedules').doc(getReminderScheduleDocId(uid, reminderId));
+}
+
+function normalizeRegisteredReminder(source) {
+  source = source || {};
+  return {
+    id: sanitizeMessageText(source.id, 100),
+    title: sanitizeMessageText(source.title || 'Hair reminder', 120),
+    date: sanitizeMessageText(source.date || source.startDate, 20),
+    startDate: sanitizeMessageText(source.startDate || source.date, 20),
+    type: sanitizeMessageText(source.type || 'custom', 40),
+    time: sanitizeMessageText(source.time || '08:00', 8),
+    frequency: sanitizeMessageText(source.frequency || 'once', 30),
+    enabled: source.enabled !== false
+  };
+}
+
 function findNextReminderMoment(reminder, zone, fromMoment) {
   const localNow = (fromMoment || DateTime.utc()).setZone(getValidTimezone(zone));
   const hm = String(reminder.time || '08:00').slice(0, 5).split(':');
@@ -435,8 +459,10 @@ function findNextReminderMoment(reminder, zone, fromMoment) {
 
   for (let offset = 0; offset <= 370; offset += 1) {
     const target = localNow.startOf('day').plus({ days: offset }).set({ hour, minute, second: 0, millisecond: 0 });
-    if (target <= localNow.plus({ seconds: 2 })) continue;
-    if (isReminderDueToday(reminder, target)) return target;
+    if (!isReminderDueToday(reminder, target)) continue;
+    if (target < localNow.minus({ seconds: 75 })) continue;
+    if (target <= localNow.plus({ seconds: 2 })) return localNow.plus({ seconds: 3 });
+    return target;
   }
   return null;
 }
@@ -448,7 +474,76 @@ function cancelRegisteredReminder(uid, reminderId) {
   registeredReminderTimers.delete(key);
 }
 
-async function deliverRegisteredReminder(uid, reminderId, dueIso) {
+async function cancelDurableReminderSchedule(uid, reminderId) {
+  cancelRegisteredReminder(uid, reminderId);
+  try {
+    await getReminderScheduleRef(uid, reminderId).delete();
+  } catch (err) {
+    console.warn('Could not delete reminder schedule:', err.message);
+  }
+}
+
+async function cancelAllRegisteredRemindersForUser(uid) {
+  if (!uid) return;
+  for (const key of registeredReminderTimers.keys()) {
+    if (key.startsWith(`${uid}:`)) {
+      const existing = registeredReminderTimers.get(key);
+      if (existing && existing.timer) clearTimeout(existing.timer);
+      registeredReminderTimers.delete(key);
+    }
+  }
+
+  try {
+    const snap = await db.collection('reminderSchedules').where('uid', '==', uid).limit(100).get();
+    if (snap.empty) return;
+    const batch = db.batch();
+    snap.docs.forEach((docSnap) => batch.delete(docSnap.ref));
+    await batch.commit();
+  } catch (err) {
+    console.warn('Could not clear reminder schedules for user:', err.message);
+  }
+}
+
+async function persistRegisteredReminderSchedule(uid, reminder, zone, dueMoment) {
+  const clean = normalizeRegisteredReminder(reminder);
+  if (!uid || !clean.id || !dueMoment || !dueMoment.isValid) return false;
+  await getReminderScheduleRef(uid, clean.id).set({
+    uid,
+    reminderId: clean.id,
+    reminder: clean,
+    timezone: getValidTimezone(zone),
+    dueAtMs: dueMoment.toUTC().toMillis(),
+    dueIso: dueMoment.toISO(),
+    updatedAt: FieldValue.serverTimestamp()
+  }, { merge: true });
+  return true;
+}
+
+async function advanceRegisteredReminderSchedule(uid, reminder, zone, dueMoment) {
+  const nextDue = findNextReminderMoment(reminder, zone, dueMoment.plus({ minutes: 1 }));
+  if (!nextDue) {
+    await cancelDurableReminderSchedule(uid, reminder.id);
+    return null;
+  }
+  armRegisteredReminder(uid, reminder, zone, dueMoment.plus({ minutes: 1 }));
+  await persistRegisteredReminderSchedule(uid, reminder, zone, nextDue);
+  return nextDue;
+}
+
+async function deferRegisteredReminderSchedule(uid, reminderId, delayMs, message) {
+  try {
+    await getReminderScheduleRef(uid, reminderId).set({
+      dueAtMs: Date.now() + Math.max(60000, delayMs || 300000),
+      lastError: sanitizeMessageText(message || 'Delivery deferred', 180),
+      lastDeferredAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (err) {
+    console.warn('Could not defer reminder schedule:', err.message);
+  }
+}
+
+async function deliverRegisteredReminder(uid, reminderId, dueIso, scheduledReminder, scheduledZone) {
   const key = getRegisteredReminderKey(uid, reminderId);
   registeredReminderTimers.delete(key);
   if (reminderDeliveryLocks.has(key)) return false;
@@ -456,24 +551,47 @@ async function deliverRegisteredReminder(uid, reminderId, dueIso) {
 
   try {
     const userRef = db.collection('users').doc(uid);
-    const [userSnap, dataSnap] = await Promise.all([
+    const scheduleRef = getReminderScheduleRef(uid, reminderId);
+    const [userSnap, dataSnap, scheduleSnap] = await Promise.all([
       userRef.get(),
-      db.collection('userData').doc(uid).get()
+      db.collection('userData').doc(uid).get(),
+      scheduleRef.get()
     ]);
-    if (!userSnap.exists || !dataSnap.exists) return false;
+    if (!userSnap.exists) {
+      await cancelDurableReminderSchedule(uid, reminderId);
+      return false;
+    }
     const userDoc = userSnap.data() || {};
-    const userData = dataSnap.data() || {};
-    if (userDoc.notificationsEnabled !== true) return false;
+    const userData = dataSnap.exists ? (dataSnap.data() || {}) : {};
+    const scheduleData = scheduleSnap.exists ? (scheduleSnap.data() || {}) : {};
+    if (userDoc.notificationsEnabled !== true) {
+      await deferRegisteredReminderSchedule(uid, reminderId, 30 * 60000, 'Notifications are disabled');
+      return false;
+    }
     let subscriptions = prunePushSubscriptions(userDoc.pushSubscriptions || []);
-    if (!subscriptions.length) return false;
+    if (!subscriptions.length) {
+      await deferRegisteredReminderSchedule(uid, reminderId, 10 * 60000, 'No active push subscription');
+      return false;
+    }
 
-    const reminder = safeArray(userData.reminders).find((item) => item && String(item.id) === String(reminderId));
-    if (!reminder || reminder.enabled === false) return false;
-    const dueMoment = DateTime.fromISO(dueIso, { setZone: true });
-    if (!dueMoment.isValid) return false;
+    const cloudReminder = safeArray(userData.reminders).find((item) => item && String(item.id) === String(reminderId));
+    const reminder = normalizeRegisteredReminder(scheduleData.reminder || cloudReminder || scheduledReminder);
+    if (!reminder.id || reminder.enabled === false) {
+      await cancelDurableReminderSchedule(uid, reminderId);
+      return false;
+    }
+    const zone = getValidTimezone(scheduleData.timezone || scheduledZone || userDoc.timezone || (userData.profile && userData.profile.timezone));
+    const dueMoment = DateTime.fromISO(scheduleData.dueIso || dueIso, { setZone: true });
+    if (!dueMoment.isValid) {
+      await cancelDurableReminderSchedule(uid, reminderId);
+      return false;
+    }
     const logKey = `${dueMoment.toFormat('yyyy-LL-dd')}:rem:${reminder.id}`;
     const notificationMeta = pruneNotificationMeta(userDoc.notificationMeta || {}, Date.now());
-    if (notificationMeta[logKey]) return false;
+    if (notificationMeta[logKey]) {
+      await advanceRegisteredReminderSchedule(uid, reminder, zone, dueMoment);
+      return false;
+    }
 
     subscriptions = await sendToSubscriptions(subscriptions, buildReminderNotification(reminder, userDoc, userData));
     notificationMeta[logKey] = Date.now();
@@ -484,10 +602,11 @@ async function deliverRegisteredReminder(uid, reminderId, dueIso) {
       updatedAt: FieldValue.serverTimestamp()
     }, { merge: true });
 
-    armRegisteredReminder(uid, reminder, userDoc.timezone || (userData.profile && userData.profile.timezone), dueMoment.plus({ minutes: 1 }));
+    await advanceRegisteredReminderSchedule(uid, reminder, zone, dueMoment);
     return true;
   } catch (err) {
     console.error('Exact reminder delivery failed:', err.message);
+    await deferRegisteredReminderSchedule(uid, reminderId, 5 * 60000, err.message);
     return false;
   } finally {
     reminderDeliveryLocks.delete(key);
@@ -514,13 +633,44 @@ function armRegisteredReminder(uid, reminder, zone, fromMoment) {
   if (current && current.timer) clearTimeout(current.timer);
 
   const timer = setTimeout(() => {
-    deliverRegisteredReminder(uid, reminder.id, dueIso).catch((err) => {
+    deliverRegisteredReminder(uid, reminder.id, dueIso, reminder, zone).catch((err) => {
       console.error('Registered reminder timer failed:', err.message);
     });
   }, Math.max(250, delayMs));
   if (typeof timer.unref === 'function') timer.unref();
-  registeredReminderTimers.set(key, { timer, dueIso });
+  registeredReminderTimers.set(key, { timer, dueIso, reminder, zone });
   return dueMoment;
+}
+
+async function processDurableReminderSchedules() {
+  if (durableReminderSweepRunning) return { running: true };
+  durableReminderSweepRunning = true;
+  const stats = { checked: 0, delivered: 0 };
+  try {
+    const snap = await db.collection('reminderSchedules')
+      .where('dueAtMs', '<=', Date.now() + 2000)
+      .limit(100)
+      .get();
+    for (const docSnap of snap.docs) {
+      const data = docSnap.data() || {};
+      stats.checked += 1;
+      if (!data.uid || !data.reminderId) {
+        await docSnap.ref.delete();
+        continue;
+      }
+      const delivered = await deliverRegisteredReminder(
+        data.uid,
+        data.reminderId,
+        data.dueIso || DateTime.fromMillis(data.dueAtMs || Date.now()).toISO(),
+        data.reminder,
+        data.timezone
+      );
+      if (delivered) stats.delivered += 1;
+    }
+    return stats;
+  } finally {
+    durableReminderSweepRunning = false;
+  }
 }
 
 function buildSmartNotification(slotKey, userDoc, userData, localMoment) {
@@ -599,6 +749,70 @@ async function sendToSubscriptionsWithStats(subscriptions, payload) {
       } else {
         stats.failed += 1;
         alive.push(sub);
+        console.warn('Broadcast push failed for one subscription:', (err && err.message) || err);
+      }
+    }
+  }
+
+  return { alive, stats };
+}
+
+function isAlreadyExistsError(err) {
+  const code = String((err && err.code) || '').toLowerCase();
+  const message = String((err && err.message) || '').toLowerCase();
+  return code === '6' || code === 'already-exists' || message.includes('already exists');
+}
+
+function getBroadcastDeliveryRef(broadcastId, endpoint) {
+  const id = crypto.createHash('sha256').update(`${broadcastId}:${endpoint}`).digest('hex').slice(0, 48);
+  return db.collection('broadcastDeliveries').doc(id);
+}
+
+async function claimBroadcastDelivery(broadcastId, endpoint) {
+  const ref = getBroadcastDeliveryRef(broadcastId, endpoint);
+  try {
+    await ref.create({
+      broadcastId,
+      endpointHash: getPushDeviceDocId(endpoint),
+      claimedAt: FieldValue.serverTimestamp()
+    });
+    return { claimed: true, ref };
+  } catch (err) {
+    if (isAlreadyExistsError(err)) return { claimed: false, ref };
+    throw err;
+  }
+}
+
+async function sendBroadcastToSubscriptionsOnce(broadcastId, subscriptions, payload) {
+  const alive = [];
+  const stats = {
+    sent: 0,
+    failed: 0,
+    removed: 0,
+    skippedDuplicate: 0
+  };
+
+  const targets = prunePushSubscriptions(subscriptions || []);
+  for (const sub of targets) {
+    const claim = await claimBroadcastDelivery(broadcastId, sub.endpoint);
+    if (!claim.claimed) {
+      stats.skippedDuplicate += 1;
+      alive.push(sub);
+      continue;
+    }
+
+    try {
+      await webpush.sendNotification(sub, JSON.stringify(payload));
+      stats.sent += 1;
+      alive.push(sub);
+    } catch (err) {
+      const code = err && err.statusCode;
+      if (code === 404 || code === 410) {
+        stats.removed += 1;
+      } else {
+        stats.failed += 1;
+        alive.push(sub);
+        await claim.ref.delete().catch(() => null);
         console.warn('Broadcast push failed for one subscription:', (err && err.message) || err);
       }
     }
@@ -1523,6 +1737,7 @@ app.post('/api/admin/broadcast', async function(req, res) {
         body: '',
         createdBy: '',
         createdByName: '',
+        pushCompleteId: '',
         clearedAt: FieldValue.serverTimestamp()
       }, { merge: true });
       lastBroadcastProcessedId = '';
@@ -1646,6 +1861,7 @@ app.post('/api/push/unsubscribe', async function(req, res) {
 
   if (!notificationsEnabled) {
     await mirrorNotificationPreferenceToUserData(uid, false, existing.timezone);
+    await cancelAllRegisteredRemindersForUser(uid);
   }
   if (deviceSnap.exists && String((deviceSnap.data() || {}).uid || '') === uid) {
     await deviceRef.delete();
@@ -1660,28 +1876,24 @@ app.post('/api/reminders/register', async function(req, res) {
 
   const body = req.body || {};
   const action = body.action === 'cancel' ? 'cancel' : 'upsert';
-  const source = body.reminder || {};
-  const reminder = {
-    id: sanitizeMessageText(source.id, 100),
-    title: sanitizeMessageText(source.title || 'Hair reminder', 120),
-    date: sanitizeMessageText(source.date || source.startDate, 20),
-    startDate: sanitizeMessageText(source.startDate || source.date, 20),
-    type: sanitizeMessageText(source.type || 'custom', 40),
-    time: sanitizeMessageText(source.time || '08:00', 8),
-    frequency: sanitizeMessageText(source.frequency || 'once', 30),
-    enabled: source.enabled !== false
-  };
+  const reminder = normalizeRegisteredReminder(body.reminder || {});
   if (!reminder.id) return jsonError(res, 400, 'missing_reminder_id', 'Missing reminder id.');
 
   if (action === 'cancel' || reminder.enabled === false) {
-    cancelRegisteredReminder(auth.uid, reminder.id);
+    await cancelDurableReminderSchedule(auth.uid, reminder.id);
     return res.json({ ok: true, action: 'cancelled' });
   }
 
   const userSnap = await db.collection('users').doc(auth.uid).get();
   const userDoc = userSnap.exists ? (userSnap.data() || {}) : {};
   const zone = getValidTimezone(body.timezone || userDoc.timezone);
-  const dueMoment = armRegisteredReminder(auth.uid, reminder, zone, DateTime.utc());
+  const dueMoment = findNextReminderMoment(reminder, zone, DateTime.utc());
+  if (dueMoment) {
+    armRegisteredReminder(auth.uid, reminder, zone, DateTime.utc());
+    await persistRegisteredReminderSchedule(auth.uid, reminder, zone, dueMoment);
+  } else {
+    await cancelDurableReminderSchedule(auth.uid, reminder.id);
+  }
   res.json({
     ok: true,
     action: dueMoment ? 'scheduled' : 'fallback',
@@ -1884,7 +2096,8 @@ async function processBroadcasts(force) {
     notificationsSent: 0,
     failedSubscriptions: 0,
     removedSubscriptions: 0,
-    skippedAlreadySent: 0
+    skippedAlreadySent: 0,
+    skippedDuplicateEndpoints: 0
   };
 
   try {
@@ -1894,6 +2107,18 @@ async function processBroadcasts(force) {
     const broadcast = broadcastSnap.data() || {};
     if (!broadcast.id || !broadcast.body) return stats;
     if (!force && broadcast.id === lastBroadcastProcessedId) return stats;
+    if (!force && broadcast.pushCompleteId === broadcast.id) {
+      lastBroadcastProcessedId = broadcast.id;
+      return stats;
+    }
+    if (!force && !broadcast.pushCompleteId && broadcast.pushedAt) {
+      lastBroadcastProcessedId = broadcast.id;
+      await broadcastSnap.ref.set({
+        pushCompleteId: broadcast.id,
+        dedupeMigratedAt: FieldValue.serverTimestamp()
+      }, { merge: true });
+      return stats;
+    }
 
     // Broadcasts are low-frequency admin actions. Pulling subscribed user docs once
     // avoids fragile Firestore cursor/index combinations and is still safe for 3k+ users.
@@ -1920,10 +2145,11 @@ async function processBroadcasts(force) {
           data: { page: 'Home', url: '/#open-page=Home', broadcastId: broadcast.id }
         };
 
-        const result = await sendToSubscriptionsWithStats(subscriptions, payload);
+        const result = await sendBroadcastToSubscriptionsOnce(broadcast.id, subscriptions, payload);
         stats.notificationsSent += result.stats.sent;
         stats.failedSubscriptions += result.stats.failed;
         stats.removedSubscriptions += result.stats.removed;
+        stats.skippedDuplicateEndpoints += result.stats.skippedDuplicate;
         await userDocSnap.ref.set({
           pushSubscriptions: result.alive,
           pushSubscriptionCount: result.alive.length,
@@ -1936,6 +2162,7 @@ async function processBroadcasts(force) {
     lastBroadcastProcessedId = broadcast.id;
     await db.collection('broadcasts').doc('global').set({
       pushStats: stats,
+      pushCompleteId: broadcast.id,
       pushedAt: FieldValue.serverTimestamp(),
       pushError: FieldValue.delete(),
       pushFailedAt: FieldValue.delete()
@@ -1948,6 +2175,12 @@ async function processBroadcasts(force) {
 
 app.listen(PORT, () => {
   console.log('Server running on ' + PORT);
+  startBackgroundLoop(
+    'reminderSchedule',
+    60000,
+    processDurableReminderSchedules,
+    15000
+  );
   startBackgroundLoop(
     'schedule',
     SCHEDULE_SWEEP_INTERVAL_MS,

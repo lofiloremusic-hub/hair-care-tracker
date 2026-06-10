@@ -82,6 +82,7 @@ const AI_LIMITS = {
 };
 
 const MAX_AI_HISTORY_ITEMS = 12;
+const STREAK_ACTIVITY_FLAGS = new Set(['CheckIn', 'Growth', 'Gallery', 'wash', 'condition', 'protein', 'hydrate', 'protective', 'oil']);
 const AI_REQUEST_TIMEOUT_MS = Math.max(15000, Math.min(60000, parseInt(process.env.AI_REQUEST_TIMEOUT_MS || '35000', 10) || 35000));
 const AI_RETRY_DELAY_MS = Math.max(300, Math.min(5000, parseInt(process.env.AI_RETRY_DELAY_MS || '900', 10) || 900));
 const SCHEDULE_CATCHUP_MINUTES = Math.max(12, parseInt(process.env.SCHEDULE_CATCHUP_MINUTES || '24', 10) || 24);
@@ -231,6 +232,53 @@ function getNotificationName(userDoc, userData) {
   return name.split(' ')[0] || 'love';
 }
 
+function normalizeServerDotFlags(value) {
+  if (Array.isArray(value)) return value.filter(Boolean);
+  return value ? [value] : [];
+}
+
+function hasServerStreakActivity(userData, dayKey) {
+  const dots = (userData && userData.dots) || {};
+  const dotActivity = normalizeServerDotFlags(dots[dayKey]).some((flag) => STREAK_ACTIVITY_FLAGS.has(flag));
+  if (dotActivity) return true;
+  return safeArray(userData && userData.checkins).some((item) => {
+    return item && String(item.date || item.ds || '') === dayKey;
+  });
+}
+
+function calculateServerStreak(userData, localMoment) {
+  const maxFreezeDays = 3;
+  let cursor = localMoment.startOf('day');
+  let anchor = null;
+  let blankDaysBeforeAnchor = 0;
+
+  for (let i = 0; i < 365; i += 1) {
+    if (hasServerStreakActivity(userData, cursor.toFormat('yyyy-LL-dd'))) {
+      anchor = cursor;
+      break;
+    }
+    if (i > 0) blankDaysBeforeAnchor += 1;
+    if (blankDaysBeforeAnchor > maxFreezeDays) return 0;
+    cursor = cursor.minus({ days: 1 });
+  }
+
+  if (!anchor) return 0;
+  let streak = 0;
+  let gap = 0;
+  cursor = anchor;
+  for (let i = 0; i < 365; i += 1) {
+    if (hasServerStreakActivity(userData, cursor.toFormat('yyyy-LL-dd'))) {
+      streak += 1;
+      gap = 0;
+    } else {
+      gap += 1;
+      if (gap > maxFreezeDays) break;
+    }
+    cursor = cursor.minus({ days: 1 });
+  }
+  return streak;
+}
+
 function getReminderIntervalDays(freq) {
   if (freq === 'once') return 0;
   if (freq === 'daily') return 1;
@@ -286,7 +334,7 @@ function buildReminderNotification(reminder, userDoc, userData) {
   };
 }
 
-function buildSmartNotification(slotKey, userDoc, userData) {
+function buildSmartNotification(slotKey, userDoc, userData, localMoment) {
   const name = getNotificationName(userDoc, userData);
   const profile = (userData && userData.profile) || {};
   const goal = profile.hairGoal || 'healthier hair';
@@ -306,6 +354,18 @@ function buildSmartNotification(slotKey, userDoc, userData) {
       data: { page: 'Home', url: '/#open-page=Home' }
     };
   }
+  const notificationMoment = localMoment || DateTime.utc();
+  const todayKey = notificationMoment.toFormat('yyyy-LL-dd');
+  const streak = calculateServerStreak(userData || {}, notificationMoment);
+  if (!hasServerStreakActivity(userData || {}, todayKey) && streak > 0) {
+    return {
+      title: `🔥 ${name}, save your streak today`,
+      body: `Your ${streak}-day streak is waiting for one small check-in. Open Hair Journal before the day ends.`,
+      tag: 'jhb-streak-save',
+      data: { page: 'Checkin', url: '/#open-page=Checkin' }
+    };
+  }
+
   return {
     title: `🌙 Evening routine reminder for ${name}`,
     body: 'Protect your progress tonight with one calm hair-care step before the day ends.',
@@ -691,14 +751,12 @@ async function handleStripeWebhook(req, res) {
 
 function sanitizeAIHistory(history) {
   if (!Array.isArray(history)) return [];
-  // Do not feed old assistant cards back into the model; that causes repeated canned templates.
   return history
     .slice(-MAX_AI_HISTORY_ITEMS)
-    .filter((item) => item && item.role !== 'ai')
-    .slice(-6)
+    .filter((item) => item && (item.role === 'user' || item.role === 'ai'))
     .map((item) => ({
-      role: 'user',
-      content: sanitizeMessageText(item && item.text, 700)
+      role: item.role === 'ai' ? 'assistant' : 'user',
+      content: sanitizeMessageText(item && item.text, item.role === 'ai' ? 900 : 700)
     }))
     .filter((item) => item.content);
 }
@@ -747,8 +805,8 @@ async function createAICompletionWithFallback(messages, isAdvanced) {
         const response = await openai.chat.completions.create({
           model,
           messages,
-          temperature: isAdvanced ? 0.74 : 0.62,
-          max_tokens: isAdvanced ? 1200 : 780
+          temperature: isAdvanced ? 0.62 : 0.55,
+          max_tokens: isAdvanced ? 900 : 620
         }, {
           timeout: AI_REQUEST_TIMEOUT_MS
         });
@@ -1447,6 +1505,11 @@ app.post('/api/chat', async function(req, res) {
       ? 'Advanced mode: be highly personal, specific, and premium-feeling. Use the user profile, logs, products, goals, and recent signals when present.'
       : 'Free mode: be warm and useful, but keep it shorter. Do not mention advanced-only audits or tell the user they are premium.',
     'Primary rule: answer exactly what the user asked in a simple ChatGPT-like way. Be direct first, then add only the useful extra details.',
+    'Start with Quick Answer: or Direct Pick: and answer in 1-2 sentences. Then use only 1-3 short sections that directly help with the current question.',
+    'Never repeat the same sentence, recommendation, or explanation in the opening and a later section. Each idea should appear once.',
+    quota.isAdvanced
+      ? 'Keep most answers around 180-260 words unless the user explicitly asks for detail.'
+      : 'Keep most answers around 100-160 words unless the user explicitly asks for detail.',
     'Do not force every answer into Diagnosis, Routine, Product Picks, or Next Move. Choose labels from the question itself, or use no labels for a simple answer.',
     'Safe hair/scalp/cosmetic questions are allowed and must be answered: dandruff, flakes, itchy scalp, dry scalp, shampoo, conditioner, oil, steam, protein treatment, shedding, breakage, frizz, growth, product choice, brand choice, routine doubts, and emotional frustration about hair.',
     'Never refuse safe hair/scalp/cosmetic guidance. If there are medical red flags, give safe general guidance and recommend a dermatologist, but still answer the harmless part.',
@@ -1516,18 +1579,18 @@ async function processScheduledNotifications() {
     const premiumAccess = hasPremiumAccess(userDoc);
     let changed = false;
 
-    if (premiumAccess) {
-      for (const slot of SMART_NOTIFICATION_SLOTS) {
-        const dueMoment = findDueLocalMomentForClock(slot.hour, slot.minute, localWindowStart, localNow);
-        if (!dueMoment) continue;
-        const logKey = `${dueMoment.toFormat('yyyy-LL-dd')}:${slot.key}`;
-        if (notificationMeta[logKey]) continue;
+    for (const slot of SMART_NOTIFICATION_SLOTS) {
+      if (!premiumAccess && slot.key !== 'evening') continue;
+      const dueMoment = findDueLocalMomentForClock(slot.hour, slot.minute, localWindowStart, localNow);
+      if (!dueMoment) continue;
+      const logKey = `${dueMoment.toFormat('yyyy-LL-dd')}:${slot.key}`;
+      if (notificationMeta[logKey]) continue;
 
-        const payload = buildSmartNotification(slot.key, userDoc, userData);
-        subscriptions = await sendToSubscriptions(subscriptions, payload);
-        notificationMeta[logKey] = Date.now();
-        changed = true;
-      }
+      const payload = buildSmartNotification(slot.key, userDoc, userData, dueMoment);
+      if (!premiumAccess && payload.tag !== 'jhb-streak-save') continue;
+      subscriptions = await sendToSubscriptions(subscriptions, payload);
+      notificationMeta[logKey] = Date.now();
+      changed = true;
     }
 
     const reminders = (userData.reminders || []).filter((item) => item && item.enabled !== false && (premiumAccess || item.smart !== true));

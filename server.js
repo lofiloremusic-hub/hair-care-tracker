@@ -519,6 +519,43 @@ async function persistRegisteredReminderSchedule(uid, reminder, zone, dueMoment)
   return true;
 }
 
+async function reconcileRegisteredReminderSchedules(uid, reminders, zone) {
+  const cleanReminders = safeArray(reminders)
+    .slice(0, 50)
+    .map(normalizeRegisteredReminder)
+    .filter((reminder) => reminder.id && reminder.enabled !== false);
+  const desiredIds = new Set(cleanReminders.map((reminder) => reminder.id));
+  const existingSnap = await db.collection('reminderSchedules').where('uid', '==', uid).limit(200).get();
+  const staleDocs = existingSnap.docs.filter((docSnap) => {
+    const data = docSnap.data() || {};
+    return !desiredIds.has(String(data.reminderId || ''));
+  });
+
+  if (staleDocs.length) {
+    const batch = db.batch();
+    staleDocs.forEach((docSnap) => {
+      const data = docSnap.data() || {};
+      if (data.reminderId) cancelRegisteredReminder(uid, data.reminderId);
+      batch.delete(docSnap.ref);
+    });
+    await batch.commit();
+  }
+
+  let scheduled = 0;
+  for (const reminder of cleanReminders) {
+    const dueMoment = findNextReminderMoment(reminder, zone, DateTime.utc());
+    if (!dueMoment) {
+      await cancelDurableReminderSchedule(uid, reminder.id);
+      continue;
+    }
+    armRegisteredReminder(uid, reminder, zone, DateTime.utc());
+    await persistRegisteredReminderSchedule(uid, reminder, zone, dueMoment);
+    scheduled += 1;
+  }
+
+  return { scheduled, removed: staleDocs.length };
+}
+
 async function advanceRegisteredReminderSchedule(uid, reminder, zone, dueMoment) {
   const nextDue = findNextReminderMoment(reminder, zone, dueMoment.plus({ minutes: 1 }));
   if (!nextDue) {
@@ -1902,6 +1939,18 @@ app.post('/api/reminders/register', async function(req, res) {
   });
 });
 
+app.post('/api/reminders/sync', async function(req, res) {
+  const auth = await requireFirebaseAuth(req, res);
+  if (!auth) return;
+
+  const body = req.body || {};
+  const userSnap = await db.collection('users').doc(auth.uid).get();
+  const userDoc = userSnap.exists ? (userSnap.data() || {}) : {};
+  const zone = getValidTimezone(body.timezone || userDoc.timezone);
+  const result = await reconcileRegisteredReminderSchedules(auth.uid, body.reminders, zone);
+  res.json({ ok: true, scheduled: result.scheduled, removed: result.removed });
+});
+
 app.post('/api/chat', async function(req, res) {
   const auth = await requireFirebaseAuth(req, res);
   if (!auth) return;
@@ -2006,6 +2055,7 @@ async function processScheduledNotifications() {
     const userData = userDataSnap.exists ? (userDataSnap.data() || {}) : {};
     const notificationMeta = pruneNotificationMeta(userDoc.notificationMeta || {}, nowUtc.toMillis());
     const premiumAccess = hasPremiumAccess(userDoc);
+    const reminders = (userData.reminders || []).filter((item) => item && item.enabled !== false && (premiumAccess || item.smart !== true));
     let changed = false;
 
     for (const slot of SMART_NOTIFICATION_SLOTS) {
@@ -2014,23 +2064,15 @@ async function processScheduledNotifications() {
       if (!dueMoment) continue;
       const logKey = `${dueMoment.toFormat('yyyy-LL-dd')}:${slot.key}`;
       if (notificationMeta[logKey]) continue;
+      const hasSpecificReminder = reminders.some((reminder) => {
+        if (!isReminderDueToday(reminder, dueMoment)) return false;
+        const hm = String(reminder.time || '08:00').slice(0, 5).split(':');
+        return (parseInt(hm[0], 10) || 0) === slot.hour && (parseInt(hm[1], 10) || 0) === slot.minute;
+      });
+      if (hasSpecificReminder) continue;
 
       const payload = buildSmartNotification(slot.key, userDoc, userData, dueMoment);
       if (!premiumAccess && payload.tag !== 'jhb-streak-save') continue;
-      subscriptions = await sendToSubscriptions(subscriptions, payload);
-      notificationMeta[logKey] = Date.now();
-      changed = true;
-    }
-
-    const reminders = (userData.reminders || []).filter((item) => item && item.enabled !== false && (premiumAccess || item.smart !== true));
-    for (const reminder of reminders) {
-      armRegisteredReminder(uid, reminder, zone, nowUtc);
-      const dueMoment = findDueReminderMoment(reminder, localWindowStart, localNow);
-      if (!dueMoment) continue;
-      const logKey = `${dueMoment.toFormat('yyyy-LL-dd')}:rem:${reminder.id}`;
-      if (notificationMeta[logKey]) continue;
-
-      const payload = buildReminderNotification(reminder, userDoc, userData);
       subscriptions = await sendToSubscriptions(subscriptions, payload);
       notificationMeta[logKey] = Date.now();
       changed = true;
@@ -2043,6 +2085,33 @@ async function processScheduledNotifications() {
         notificationMeta,
         updatedAt: FieldValue.serverTimestamp()
       }, { merge: true });
+    }
+
+    if (!reminders.length) continue;
+    let durableIds = new Set();
+    let durableLookupReady = true;
+    try {
+      const durableSnap = await db.collection('reminderSchedules').where('uid', '==', uid).limit(200).get();
+      durableIds = new Set(durableSnap.docs.map((docSnap) => String((docSnap.data() || {}).reminderId || '')));
+    } catch (err) {
+      durableLookupReady = false;
+      console.warn('Could not inspect durable reminders for user:', err.message);
+    }
+    if (!durableLookupReady) continue;
+
+    for (const reminder of reminders) {
+      if (!reminder.id || durableIds.has(String(reminder.id))) continue;
+      const dueMoment = findDueReminderMoment(reminder, localWindowStart, localNow);
+      if (dueMoment) {
+        await persistRegisteredReminderSchedule(uid, reminder, zone, dueMoment);
+        await deliverRegisteredReminder(uid, reminder.id, dueMoment.toISO(), reminder, zone);
+        continue;
+      }
+
+      const nextDue = findNextReminderMoment(reminder, zone, nowUtc);
+      if (!nextDue) continue;
+      armRegisteredReminder(uid, reminder, zone, nowUtc);
+      await persistRegisteredReminderSchedule(uid, reminder, zone, nextDue);
     }
   }
   } finally {

@@ -1,4 +1,5 @@
 require('dotenv').config();
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const { OpenAI } = require('openai');
@@ -134,6 +135,9 @@ const backgroundJobState = {
   broadcast: { blockedUntil: 0, quotaFailures: 0 }
 };
 const MAX_PUSH_SUBSCRIPTIONS_PER_USER = Math.max(1, Math.min(5, parseInt(process.env.MAX_PUSH_SUBSCRIPTIONS_PER_USER || '1', 10) || 1));
+const MAX_EXACT_REMINDER_DELAY_MS = 7 * 24 * 60 * 60 * 1000;
+const registeredReminderTimers = new Map();
+const reminderDeliveryLocks = new Set();
 
 const REMINDER_TYPE_EMOJI = {
   wash: '🧼',
@@ -160,6 +164,91 @@ function cleanSubscription(subscription, meta) {
   if (meta && meta.userAgent) cleaned.userAgent = String(meta.userAgent).slice(0, 180);
   cleaned.updatedAtMs = Date.now();
   return cleaned;
+}
+
+function getPushDeviceDocId(endpoint) {
+  return crypto.createHash('sha256').update(String(endpoint || '')).digest('hex').slice(0, 48);
+}
+
+function subscriptionsMatchDevice(left, right) {
+  if (!left || !right) return false;
+  if (left.endpoint && right.endpoint && left.endpoint === right.endpoint) return true;
+  return !!(left.clientDeviceId && right.clientDeviceId && left.clientDeviceId === right.clientDeviceId);
+}
+
+async function findLegacyPushOwners(cleaned, currentUid) {
+  const owners = [];
+  const snap = await db.collection('users').where('notificationsEnabled', '==', true).limit(250).get();
+  snap.docs.forEach((docSnap) => {
+    if (docSnap.id === currentUid) return;
+    const data = docSnap.data() || {};
+    if ((data.pushSubscriptions || []).some((sub) => subscriptionsMatchDevice(sub, cleaned))) {
+      owners.push(docSnap);
+    }
+  });
+  return owners;
+}
+
+async function transferPushDeviceOwnership(uid, cleaned, userPatch) {
+  const deviceRef = db.collection('pushDevices').doc(getPushDeviceDocId(cleaned.endpoint));
+  const deviceSnap = await deviceRef.get();
+  const registeredOwnerUid = deviceSnap.exists ? String((deviceSnap.data() || {}).uid || '') : '';
+  let oldOwnerSnaps = [];
+
+  if (registeredOwnerUid && registeredOwnerUid !== uid) {
+    const oldSnap = await db.collection('users').doc(registeredOwnerUid).get();
+    if (oldSnap.exists) oldOwnerSnaps = [oldSnap];
+  } else if (!registeredOwnerUid) {
+    oldOwnerSnaps = await findLegacyPushOwners(cleaned, uid);
+  }
+
+  const currentRef = db.collection('users').doc(uid);
+  const currentSnap = await currentRef.get();
+  const current = currentSnap.exists ? (currentSnap.data() || {}) : {};
+  const existingSubscriptions = (current.pushSubscriptions || []).filter((sub) => {
+    return sub && sub.endpoint && !subscriptionsMatchDevice(sub, cleaned);
+  });
+  const subscriptions = prunePushSubscriptions([].concat(existingSubscriptions, cleaned).filter(Boolean));
+  const batch = db.batch();
+  const detachedOwners = [];
+
+  oldOwnerSnaps.forEach((oldSnap) => {
+    const oldData = oldSnap.data() || {};
+    const remaining = prunePushSubscriptions((oldData.pushSubscriptions || []).filter((sub) => {
+      return sub && sub.endpoint && !subscriptionsMatchDevice(sub, cleaned);
+    }));
+    batch.set(oldSnap.ref, {
+      notificationsEnabled: remaining.length > 0,
+      pushSubscriptions: remaining,
+      pushSubscriptionCount: remaining.length,
+      updatedAt: FieldValue.serverTimestamp()
+    }, { merge: true });
+    detachedOwners.push({
+      uid: oldSnap.id,
+      enabled: remaining.length > 0,
+      timezone: oldData.timezone || ''
+    });
+  });
+
+  batch.set(currentRef, Object.assign({}, userPatch, {
+    uid,
+    notificationsEnabled: true,
+    pushSubscriptions: subscriptions,
+    pushSubscriptionCount: subscriptions.length,
+    updatedAt: FieldValue.serverTimestamp()
+  }), { merge: true });
+  batch.set(deviceRef, {
+    uid,
+    endpoint: cleaned.endpoint,
+    clientDeviceId: cleaned.clientDeviceId || '',
+    updatedAt: FieldValue.serverTimestamp()
+  }, { merge: true });
+  await batch.commit();
+
+  await Promise.all(detachedOwners.map((owner) => {
+    return mirrorNotificationPreferenceToUserData(owner.uid, owner.enabled, owner.timezone);
+  }));
+  return { count: subscriptions.length, detachedUids: detachedOwners.map((owner) => owner.uid) };
 }
 
 function getTodayKey(zone) {
@@ -334,6 +423,106 @@ function buildReminderNotification(reminder, userDoc, userData) {
   };
 }
 
+function getRegisteredReminderKey(uid, reminderId) {
+  return `${uid}:${reminderId}`;
+}
+
+function findNextReminderMoment(reminder, zone, fromMoment) {
+  const localNow = (fromMoment || DateTime.utc()).setZone(getValidTimezone(zone));
+  const hm = String(reminder.time || '08:00').slice(0, 5).split(':');
+  const hour = parseInt(hm[0], 10) || 0;
+  const minute = parseInt(hm[1], 10) || 0;
+
+  for (let offset = 0; offset <= 370; offset += 1) {
+    const target = localNow.startOf('day').plus({ days: offset }).set({ hour, minute, second: 0, millisecond: 0 });
+    if (target <= localNow.plus({ seconds: 2 })) continue;
+    if (isReminderDueToday(reminder, target)) return target;
+  }
+  return null;
+}
+
+function cancelRegisteredReminder(uid, reminderId) {
+  const key = getRegisteredReminderKey(uid, reminderId);
+  const existing = registeredReminderTimers.get(key);
+  if (existing && existing.timer) clearTimeout(existing.timer);
+  registeredReminderTimers.delete(key);
+}
+
+async function deliverRegisteredReminder(uid, reminderId, dueIso) {
+  const key = getRegisteredReminderKey(uid, reminderId);
+  registeredReminderTimers.delete(key);
+  if (reminderDeliveryLocks.has(key)) return false;
+  reminderDeliveryLocks.add(key);
+
+  try {
+    const userRef = db.collection('users').doc(uid);
+    const [userSnap, dataSnap] = await Promise.all([
+      userRef.get(),
+      db.collection('userData').doc(uid).get()
+    ]);
+    if (!userSnap.exists || !dataSnap.exists) return false;
+    const userDoc = userSnap.data() || {};
+    const userData = dataSnap.data() || {};
+    if (userDoc.notificationsEnabled !== true) return false;
+    let subscriptions = prunePushSubscriptions(userDoc.pushSubscriptions || []);
+    if (!subscriptions.length) return false;
+
+    const reminder = safeArray(userData.reminders).find((item) => item && String(item.id) === String(reminderId));
+    if (!reminder || reminder.enabled === false) return false;
+    const dueMoment = DateTime.fromISO(dueIso, { setZone: true });
+    if (!dueMoment.isValid) return false;
+    const logKey = `${dueMoment.toFormat('yyyy-LL-dd')}:rem:${reminder.id}`;
+    const notificationMeta = pruneNotificationMeta(userDoc.notificationMeta || {}, Date.now());
+    if (notificationMeta[logKey]) return false;
+
+    subscriptions = await sendToSubscriptions(subscriptions, buildReminderNotification(reminder, userDoc, userData));
+    notificationMeta[logKey] = Date.now();
+    await userRef.set({
+      pushSubscriptions: subscriptions,
+      pushSubscriptionCount: subscriptions.length,
+      notificationMeta,
+      updatedAt: FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    armRegisteredReminder(uid, reminder, userDoc.timezone || (userData.profile && userData.profile.timezone), dueMoment.plus({ minutes: 1 }));
+    return true;
+  } catch (err) {
+    console.error('Exact reminder delivery failed:', err.message);
+    return false;
+  } finally {
+    reminderDeliveryLocks.delete(key);
+  }
+}
+
+function armRegisteredReminder(uid, reminder, zone, fromMoment) {
+  if (!uid || !reminder || !reminder.id || reminder.enabled === false) {
+    if (uid && reminder && reminder.id) cancelRegisteredReminder(uid, reminder.id);
+    return null;
+  }
+  const dueMoment = findNextReminderMoment(reminder, zone, fromMoment || DateTime.utc());
+  if (!dueMoment) {
+    cancelRegisteredReminder(uid, reminder.id);
+    return null;
+  }
+  const delayMs = dueMoment.toUTC().toMillis() - Date.now();
+  if (delayMs <= 0 || delayMs > MAX_EXACT_REMINDER_DELAY_MS) return dueMoment;
+
+  const key = getRegisteredReminderKey(uid, reminder.id);
+  const current = registeredReminderTimers.get(key);
+  const dueIso = dueMoment.toISO();
+  if (current && current.dueIso === dueIso) return dueMoment;
+  if (current && current.timer) clearTimeout(current.timer);
+
+  const timer = setTimeout(() => {
+    deliverRegisteredReminder(uid, reminder.id, dueIso).catch((err) => {
+      console.error('Registered reminder timer failed:', err.message);
+    });
+  }, Math.max(250, delayMs));
+  if (typeof timer.unref === 'function') timer.unref();
+  registeredReminderTimers.set(key, { timer, dueIso });
+  return dueMoment;
+}
+
 function buildSmartNotification(slotKey, userDoc, userData, localMoment) {
   const name = getNotificationName(userDoc, userData);
   const profile = (userData && userData.profile) || {};
@@ -454,9 +643,9 @@ function getValidTimezone(requestedZone) {
 async function mirrorNotificationPreferenceToUserData(uid, enabled, timezone) {
   const profilePatch = {
     notifications: !!enabled,
-    pushLinked: !!enabled,
-    timezone: getValidTimezone(timezone)
+    pushLinked: !!enabled
   };
+  if (timezone) profilePatch.timezone = getValidTimezone(timezone);
   if (enabled) profilePatch.notificationPermission = 'granted';
 
   try {
@@ -1421,29 +1610,16 @@ app.post('/api/push/subscribe', async function(req, res) {
     userAgent: req.headers['user-agent'] || ''
   });
   if (!cleaned) return jsonError(res, 400, 'invalid_subscription', 'Missing or invalid push subscription.');
-  const userRef = db.collection('users').doc(uid);
-  const snap = await userRef.get();
-  const existing = snap.exists ? (snap.data() || {}) : {};
-  const existingSubscriptions = (existing.pushSubscriptions || []).filter((sub) => {
-    if (!sub || !sub.endpoint) return false;
-    return !(cleaned.clientDeviceId && sub.clientDeviceId === cleaned.clientDeviceId);
+  const zone = getValidTimezone(timezone);
+  const transfer = await transferPushDeviceOwnership(uid, cleaned, {
+    email: auth.email || email || '',
+    displayName: auth.name || displayName || '',
+    timezone: zone
   });
-  const subscriptions = prunePushSubscriptions([].concat(existingSubscriptions, cleaned).filter(Boolean));
 
-  await userRef.set({
-    uid,
-    email: auth.email || email || existing.email || '',
-    displayName: auth.name || displayName || existing.displayName || '',
-    timezone: getValidTimezone(timezone || existing.timezone),
-    notificationsEnabled: notificationsEnabled !== false,
-    pushSubscriptions: subscriptions,
-    pushSubscriptionCount: subscriptions.length,
-    updatedAt: FieldValue.serverTimestamp()
-  }, { merge: true });
+  await mirrorNotificationPreferenceToUserData(uid, notificationsEnabled !== false, zone);
 
-  await mirrorNotificationPreferenceToUserData(uid, notificationsEnabled !== false, timezone || existing.timezone);
-
-  res.json({ ok: true, count: subscriptions.length });
+  res.json({ ok: true, count: transfer.count, detachedUsers: transfer.detachedUids.length });
 });
 
 app.post('/api/push/unsubscribe', async function(req, res) {
@@ -1458,6 +1634,8 @@ app.post('/api/push/unsubscribe', async function(req, res) {
   const snap = await userRef.get();
   const existing = snap.exists ? (snap.data() || {}) : {};
   const subscriptions = prunePushSubscriptions((existing.pushSubscriptions || []).filter((sub) => sub && sub.endpoint !== endpoint));
+  const deviceRef = db.collection('pushDevices').doc(getPushDeviceDocId(endpoint));
+  const deviceSnap = await deviceRef.get();
 
   await userRef.set({
     notificationsEnabled: !!notificationsEnabled,
@@ -1469,8 +1647,47 @@ app.post('/api/push/unsubscribe', async function(req, res) {
   if (!notificationsEnabled) {
     await mirrorNotificationPreferenceToUserData(uid, false, existing.timezone);
   }
+  if (deviceSnap.exists && String((deviceSnap.data() || {}).uid || '') === uid) {
+    await deviceRef.delete();
+  }
 
   res.json({ ok: true });
+});
+
+app.post('/api/reminders/register', async function(req, res) {
+  const auth = await requireFirebaseAuth(req, res);
+  if (!auth) return;
+
+  const body = req.body || {};
+  const action = body.action === 'cancel' ? 'cancel' : 'upsert';
+  const source = body.reminder || {};
+  const reminder = {
+    id: sanitizeMessageText(source.id, 100),
+    title: sanitizeMessageText(source.title || 'Hair reminder', 120),
+    date: sanitizeMessageText(source.date || source.startDate, 20),
+    startDate: sanitizeMessageText(source.startDate || source.date, 20),
+    type: sanitizeMessageText(source.type || 'custom', 40),
+    time: sanitizeMessageText(source.time || '08:00', 8),
+    frequency: sanitizeMessageText(source.frequency || 'once', 30),
+    enabled: source.enabled !== false
+  };
+  if (!reminder.id) return jsonError(res, 400, 'missing_reminder_id', 'Missing reminder id.');
+
+  if (action === 'cancel' || reminder.enabled === false) {
+    cancelRegisteredReminder(auth.uid, reminder.id);
+    return res.json({ ok: true, action: 'cancelled' });
+  }
+
+  const userSnap = await db.collection('users').doc(auth.uid).get();
+  const userDoc = userSnap.exists ? (userSnap.data() || {}) : {};
+  const zone = getValidTimezone(body.timezone || userDoc.timezone);
+  const dueMoment = armRegisteredReminder(auth.uid, reminder, zone, DateTime.utc());
+  res.json({
+    ok: true,
+    action: dueMoment ? 'scheduled' : 'fallback',
+    exactTimer: !!(dueMoment && (dueMoment.toUTC().toMillis() - Date.now()) <= MAX_EXACT_REMINDER_DELAY_MS),
+    dueAt: dueMoment ? dueMoment.toISO() : null
+  });
 });
 
 app.post('/api/chat', async function(req, res) {
@@ -1595,6 +1812,7 @@ async function processScheduledNotifications() {
 
     const reminders = (userData.reminders || []).filter((item) => item && item.enabled !== false && (premiumAccess || item.smart !== true));
     for (const reminder of reminders) {
+      armRegisteredReminder(uid, reminder, zone, nowUtc);
       const dueMoment = findDueReminderMoment(reminder, localWindowStart, localNow);
       if (!dueMoment) continue;
       const logKey = `${dueMoment.toFormat('yyyy-LL-dd')}:rem:${reminder.id}`;

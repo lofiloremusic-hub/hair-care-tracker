@@ -125,7 +125,6 @@ const AI_MODELS = {
   standard: parseAIModels(process.env.AI_STANDARD_MODELS || process.env.AI_MODEL_STANDARD || process.env.AI_MODEL_FREE, ['openai/gpt-4o-mini', 'google/gemini-2.0-flash-001', 'openrouter/auto'])
 };
 
-let lastScheduleSweepAt = 0;
 let scheduleCursorId = '';
 let scheduleRunning = false;
 let broadcastRunning = false;
@@ -1349,12 +1348,9 @@ async function refundServerAIQuota(userRef, periodKey) {
   }
 }
 
-function getCatchupWindowStart(nowUtc, lastRunAt) {
-  if (!lastRunAt) return nowUtc.minus({ minutes: SCHEDULE_CATCHUP_MINUTES });
-  const previous = DateTime.fromMillis(lastRunAt).toUTC();
-  if (!previous.isValid) return nowUtc.minus({ minutes: SCHEDULE_CATCHUP_MINUTES });
-  const floor = nowUtc.minus({ minutes: SCHEDULE_CATCHUP_MINUTES });
-  return previous < floor ? floor : previous.minus({ seconds: 2 });
+function getCatchupWindowStart(nowUtc) {
+  // User scans are paginated; every page needs enough lookback to cover a full rotation.
+  return nowUtc.minus({ minutes: SCHEDULE_CATCHUP_MINUTES });
 }
 
 function getCandidateLocalDays(windowStartLocal, windowEndLocal) {
@@ -2038,8 +2034,7 @@ async function processScheduledNotifications() {
   try {
   const usersSnap = await getNextScheduledUserPage();
   const nowUtc = DateTime.utc();
-  const windowStartUtc = getCatchupWindowStart(nowUtc, lastScheduleSweepAt);
-  lastScheduleSweepAt = nowUtc.toMillis();
+  const windowStartUtc = getCatchupWindowStart(nowUtc);
 
   for (const userDocSnap of usersSnap.docs) {
     const userDoc = userDocSnap.data() || {};

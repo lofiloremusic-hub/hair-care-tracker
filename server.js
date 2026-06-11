@@ -2530,8 +2530,9 @@ async function processBroadcasts(force) {
       const batch = docs.slice(i, i + BROADCAST_BATCH_SIZE);
       await Promise.all(batch.map(async (userDocSnap) => {
         const userDoc = userDocSnap.data() || {};
-        const subscriptions = prunePushSubscriptions(userDoc.pushSubscriptions || []);
         stats.usersChecked += 1;
+        if (!hasPremiumAccess(userDoc)) return;
+        const subscriptions = prunePushSubscriptions(userDoc.pushSubscriptions || []);
         if (!subscriptions.length) return;
         stats.subscribedUsers += 1;
         if (userDoc.lastBroadcastPushId === broadcast.id) {

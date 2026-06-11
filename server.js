@@ -103,6 +103,11 @@ const STRIPE_PRODUCT_NAME = process.env.STRIPE_PRODUCT_NAME || 'Hair Journal Tra
 const STRIPE_PREMIUM_MONTHLY_CENTS = Math.max(100, parseInt(process.env.STRIPE_PREMIUM_MONTHLY_CENTS || '1000', 10) || 1000);
 const STRIPE_PREMIUM_YEARLY_CENTS = Math.max(100, parseInt(process.env.STRIPE_PREMIUM_YEARLY_CENTS || '9500', 10) || 9500);
 const STRIPE_TRIAL_DAYS = Math.max(0, Math.min(60, parseInt(process.env.STRIPE_TRIAL_DAYS || '14', 10) || 14));
+const APP_TRIAL_DAYS = Math.max(1, Math.min(60, parseInt(process.env.APP_TRIAL_DAYS || '14', 10) || 14));
+const PAYMENT_GRACE_DAYS = Math.max(0, Math.min(14, parseInt(process.env.PAYMENT_GRACE_DAYS || '3', 10) || 3));
+const APP_TRIAL_ROLLOUT_ISO = (process.env.APP_TRIAL_ROLLOUT_ISO || '2026-06-11T00:00:00.000Z').trim();
+const APP_TRIAL_POPUP_DAYS = new Set([1, 7, 13]);
+const ALLOW_STRIPE_TRIAL_CHECKOUT = process.env.ALLOW_STRIPE_TRIAL_CHECKOUT === 'true';
 const STRIPE_SUCCESS_URL = (process.env.STRIPE_SUCCESS_URL || 'https://jordyn-haircare.web.app/#open-page=Premium').trim();
 const STRIPE_CANCEL_URL = (process.env.STRIPE_CANCEL_URL || 'https://jordyn-haircare.web.app/#open-page=Premium').trim();
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
@@ -600,6 +605,10 @@ async function deliverRegisteredReminder(uid, reminderId, dueIso, scheduledRemin
     const userDoc = userSnap.data() || {};
     const userData = dataSnap.exists ? (dataSnap.data() || {}) : {};
     const scheduleData = scheduleSnap.exists ? (scheduleSnap.data() || {}) : {};
+    if (!hasPremiumAccess(userDoc)) {
+      await cancelDurableReminderSchedule(uid, reminderId);
+      return false;
+    }
     if (userDoc.notificationsEnabled !== true) {
       await deferRegisteredReminderSchedule(uid, reminderId, 30 * 60000, 'Notifications are disabled');
       return false;
@@ -954,8 +963,253 @@ async function requireAdminAuth(req, res) {
   return null;
 }
 
+function timestampToMillis(value) {
+  if (!value) return 0;
+  if (typeof value.toMillis === 'function') return value.toMillis();
+  if (typeof value.toDate === 'function') return value.toDate().getTime();
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === 'number') return value < 10000000000 ? value * 1000 : value;
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function dateFromMillis(ms) {
+  const value = Number(ms || 0);
+  return value > 0 ? new Date(value) : null;
+}
+
+function isoFromMillis(ms) {
+  const date = dateFromMillis(ms);
+  return date ? date.toISOString() : null;
+}
+
+function getTrialRolloutMillis() {
+  const parsed = Date.parse(APP_TRIAL_ROLLOUT_ISO);
+  return Number.isFinite(parsed) ? parsed : Date.UTC(2026, 5, 11);
+}
+
+function normalizeSubscriptionStatus(value) {
+  const status = String(value || '').toLowerCase().replace(/\s+/g, '_').trim();
+  if (status === 'payment_failed') return 'past_due';
+  if (status === 'paid' || status === 'premium') return 'active';
+  return status;
+}
+
+function getSubscriptionStatus(userDoc) {
+  return normalizeSubscriptionStatus(
+    (userDoc && (userDoc.subscription_status || userDoc.subscriptionStatus || userDoc.premiumStatus)) || ''
+  );
+}
+
+function buildAccessState(userDoc, nowUtc) {
+  userDoc = userDoc || {};
+  const nowMs = nowUtc && typeof nowUtc.toMillis === 'function' ? nowUtc.toMillis() : Date.now();
+  const status = getSubscriptionStatus(userDoc);
+  const isAdmin = userDoc.isAdmin === true || ADMIN_EMAILS.has(String(userDoc.email || '').toLowerCase());
+  const subscriptionPlan = String(userDoc.subscriptionPlan || '').toLowerCase();
+  const trialStartMs = timestampToMillis(userDoc.trial_start_date || userDoc.trialStartDate);
+  const trialEndMs = timestampToMillis(userDoc.trial_end_date || userDoc.trialEndDate)
+    || (trialStartMs ? trialStartMs + APP_TRIAL_DAYS * 86400000 : 0);
+  const currentPeriodEndMs = timestampToMillis(userDoc.subscription_current_period_end || userDoc.subscriptionCurrentPeriodEnd || userDoc.stripeCurrentPeriodEnd);
+  const storedGraceUntilMs = timestampToMillis(userDoc.subscription_grace_until || userDoc.subscriptionGraceUntil);
+  const paymentProblem = userDoc.premiumPaymentProblem === true || status === 'past_due' || status === 'unpaid';
+  const derivedGraceUntilMs = paymentProblem && !storedGraceUntilMs && currentPeriodEndMs
+    ? currentPeriodEndMs + PAYMENT_GRACE_DAYS * 86400000
+    : 0;
+  const graceUntilMs = Math.max(storedGraceUntilMs || 0, derivedGraceUntilMs || 0);
+  const trialActive = !!(trialStartMs && trialEndMs && nowMs < trialEndMs);
+  const manualPremium = userDoc.isPremium === true && subscriptionPlan && subscriptionPlan !== 'stripe';
+  const stripeStatusActive = !paymentProblem && (status === 'active' || status === 'trialing');
+  const legacyStripeActive = userDoc.isPremium === true
+    && subscriptionPlan === 'stripe'
+    && !paymentProblem
+    && (!currentPeriodEndMs || nowMs <= currentPeriodEndMs + 3600000);
+  const subscriptionActive = manualPremium || stripeStatusActive || legacyStripeActive;
+  const graceActive = !!(paymentProblem && graceUntilMs && nowMs < graceUntilMs);
+
+  let state = 'expired';
+  let allowed = false;
+  let reason = 'trial_expired';
+  if (isAdmin) {
+    allowed = true;
+    state = 'admin';
+    reason = 'admin';
+  } else if (subscriptionActive) {
+    allowed = true;
+    state = 'subscribed';
+    reason = 'subscription_active';
+  } else if (graceActive) {
+    allowed = true;
+    state = 'grace';
+    reason = 'payment_grace';
+  } else if (trialActive) {
+    allowed = true;
+    state = 'trial';
+    reason = 'trial_active';
+  } else if (paymentProblem) {
+    state = 'payment_failed';
+    reason = 'payment_failed';
+  }
+
+  return {
+    verified: true,
+    allowed,
+    state,
+    reason,
+    isAdmin,
+    subscriptionStatus: status || (subscriptionActive ? 'active' : 'none'),
+    subscriptionPlan: subscriptionPlan || null,
+    paymentProblem,
+    trialActive,
+    trialStartMs,
+    trialEndMs,
+    trialDaysLeft: trialEndMs ? Math.max(0, Math.ceil((trialEndMs - nowMs) / 86400000)) : 0,
+    graceActive,
+    graceUntilMs,
+    currentPeriodEndMs,
+    serverNowMs: nowMs
+  };
+}
+
+function serializeAccessState(access) {
+  access = access || {};
+  return {
+    verified: access.verified === true,
+    allowed: access.allowed === true,
+    state: access.state || 'unknown',
+    reason: access.reason || '',
+    isAdmin: access.isAdmin === true,
+    subscriptionStatus: access.subscriptionStatus || 'none',
+    subscriptionPlan: access.subscriptionPlan || null,
+    paymentProblem: access.paymentProblem === true,
+    trialActive: access.trialActive === true,
+    trialStartDate: isoFromMillis(access.trialStartMs),
+    trialEndDate: isoFromMillis(access.trialEndMs),
+    trialDaysLeft: Math.max(0, parseInt(access.trialDaysLeft || 0, 10) || 0),
+    graceActive: access.graceActive === true,
+    graceUntilDate: isoFromMillis(access.graceUntilMs),
+    currentPeriodEndDate: isoFromMillis(access.currentPeriodEndMs),
+    monthlyPriceCents: STRIPE_PREMIUM_MONTHLY_CENTS,
+    monthlyPriceLabel: '$10/month',
+    serverNow: isoFromMillis(access.serverNowMs || Date.now())
+  };
+}
+
+function buildTrialPopup(access, userDoc, timezone) {
+  if (!access || access.state !== 'trial' || !access.trialStartMs || !access.trialEndMs) return null;
+  const zone = getValidTimezone(timezone || userDoc.timezone);
+  const nowLocal = DateTime.fromMillis(access.serverNowMs || Date.now(), { zone: 'utc' }).setZone(zone).startOf('day');
+  const startLocal = DateTime.fromMillis(access.trialStartMs, { zone: 'utc' }).setZone(zone).startOf('day');
+  const day = Math.floor(nowLocal.diff(startLocal, 'days').days) + 1;
+  if (!APP_TRIAL_POPUP_DAYS.has(day)) return null;
+  const seen = userDoc.trialPopupSeenDays || {};
+  if (seen[String(day)] || (Array.isArray(seen) && seen.indexOf(day) !== -1)) return null;
+
+  const copyByDay = {
+    1: 'You have 14 days of free access — no credit card needed. Enjoy everything!',
+    7: '7 days left on your free trial — upgrade to keep access for just $10/month',
+    13: 'Your free trial ends tomorrow — subscribe for $10/month to keep using the app'
+  };
+
+  return {
+    day,
+    title: day === 1 ? 'Welcome to your free trial' : day === 7 ? 'Halfway through your trial' : 'Trial ends tomorrow',
+    message: copyByDay[day],
+    ctaLabel: 'Upgrade Now — $10/month',
+    dismissLabel: day === 13 ? 'I understand' : 'Remind Me Later',
+    forceAcknowledge: day === 13,
+    trialEndDate: isoFromMillis(access.trialEndMs),
+    monthlyPriceLabel: '$10/month'
+  };
+}
+
+async function ensureTrialAndAccessState(auth, options) {
+  options = options || {};
+  const userRef = db.collection('users').doc(auth.uid);
+  const nowMs = Date.now();
+  const requestedZone = options.timezone ? getValidTimezone(options.timezone) : '';
+  const result = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+    const existing = snap.exists ? (snap.data() || {}) : {};
+    const zone = requestedZone || getValidTimezone(existing.timezone || 'UTC');
+    const materialized = Object.assign({
+      uid: auth.uid,
+      email: auth.email || existing.email || '',
+      displayName: auth.name || existing.displayName || '',
+      isAdmin: existing.isAdmin === true || ADMIN_EMAILS.has(String(auth.email || existing.email || '').toLowerCase()),
+      isPremium: existing.isPremium === true,
+      subscriptionPlan: existing.subscriptionPlan || null
+    }, existing);
+    const patch = {
+      uid: auth.uid,
+      email: auth.email || existing.email || '',
+      displayName: auth.name || existing.displayName || '',
+      updatedAt: FieldValue.serverTimestamp()
+    };
+    const localPatch = { timezone: zone };
+    if (!snap.exists && !existing.createdAt) patch.createdAt = FieldValue.serverTimestamp();
+    if (requestedZone || !existing.timezone) patch.timezone = zone;
+
+    const existingTrialStartMs = timestampToMillis(existing.trial_start_date || existing.trialStartDate);
+    if (!existingTrialStartMs) {
+      const createdMs = timestampToMillis(existing.createdAt);
+      const rolloutMs = getTrialRolloutMillis();
+      const startMs = snap.exists ? Math.max(createdMs || rolloutMs, rolloutMs) : Math.max(nowMs, rolloutMs);
+      patch.trial_start_date = dateFromMillis(startMs);
+      patch.trial_end_date = dateFromMillis(startMs + APP_TRIAL_DAYS * 86400000);
+      localPatch.trial_start_date = patch.trial_start_date;
+      localPatch.trial_end_date = patch.trial_end_date;
+    } else if (!timestampToMillis(existing.trial_end_date || existing.trialEndDate)) {
+      patch.trial_end_date = dateFromMillis(existingTrialStartMs + APP_TRIAL_DAYS * 86400000);
+      localPatch.trial_end_date = patch.trial_end_date;
+    }
+
+    if (!existing.subscription_status && !existing.subscriptionStatus) {
+      if (existing.isPremium === true && !existing.premiumPaymentProblem) {
+        patch.subscription_status = 'active';
+        localPatch.subscription_status = 'active';
+      } else if (existing.premiumPaymentProblem === true) {
+        patch.subscription_status = 'past_due';
+        localPatch.subscription_status = 'past_due';
+      }
+    }
+
+    tx.set(userRef, compactDefined(patch), { merge: true });
+    return Object.assign({}, materialized, localPatch);
+  });
+
+  const access = buildAccessState(result, DateTime.fromMillis(nowMs, { zone: 'utc' }));
+  const popupZone = requestedZone || result.timezone || 'UTC';
+  return {
+    userRef,
+    userDoc: result,
+    access,
+    popup: buildTrialPopup(access, result, popupZone)
+  };
+}
+
+async function requireActiveAppAccess(req, res, auth) {
+  try {
+    const body = req.body || {};
+    const guard = await ensureTrialAndAccessState(auth, {
+      timezone: body.timezone || req.query.timezone || ''
+    });
+    if (!guard.access.allowed) {
+      jsonError(res, 402, 'access_required', 'Your free trial has ended. Subscribe for $10/month to keep using Hair Journal.', {
+        access: serializeAccessState(guard.access)
+      });
+      return null;
+    }
+    return guard;
+  } catch (err) {
+    console.error('Access check failed:', err.message);
+    jsonError(res, 500, 'access_check_failed', 'Could not verify app access. Please try again.');
+    return null;
+  }
+}
+
 function hasPremiumAccess(userDoc) {
-  return !!(userDoc && (userDoc.isAdmin === true || userDoc.isPremium === true));
+  return buildAccessState(userDoc, DateTime.utc()).allowed === true;
 }
 
 function sanitizeMessageText(value, maxLength) {
@@ -1050,7 +1304,9 @@ async function ensureStripeCustomer(auth, userRef, userDoc) {
 
 async function writeStripePremiumState(uid, state) {
   const userRef = db.collection('users').doc(uid);
-  const isPremium = state.isPremium === true;
+  const requestedStatus = normalizeSubscriptionStatus(state.subscriptionStatus || state.status || (state.isPremium ? 'active' : 'inactive'));
+  const paymentProblem = state.paymentProblem === true || requestedStatus === 'past_due' || requestedStatus === 'unpaid';
+  const isPremium = state.isPremium === true && !paymentProblem;
 
   await db.runTransaction(async (tx) => {
     const snap = await tx.get(userRef);
@@ -1060,18 +1316,28 @@ async function writeStripePremiumState(uid, state) {
     if (!isPremium && existing.subscriptionPlan && existing.subscriptionPlan !== 'stripe') return;
     if (!isPremium && state.stripeSubscriptionId && existing.stripeSubscriptionId && existing.stripeSubscriptionId !== state.stripeSubscriptionId) return;
 
+    const nowMs = Date.now();
+    const existingGraceUntilMs = timestampToMillis(existing.subscription_grace_until || existing.subscriptionGraceUntil);
+    const nextGraceUntilMs = paymentProblem
+      ? (existingGraceUntilMs > nowMs ? existingGraceUntilMs : nowMs + PAYMENT_GRACE_DAYS * 86400000)
+      : 0;
+    const subscriptionStatus = paymentProblem ? 'past_due' : (isPremium ? 'active' : (requestedStatus || 'inactive'));
+
     tx.set(userRef, compactDefined({
       isPremium,
-      subscriptionPlan: isPremium ? 'stripe' : null,
+      subscriptionPlan: isPremium || paymentProblem ? 'stripe' : null,
       premiumSource: isPremium ? 'stripe' : null,
-      premiumStatus: state.status || null,
+      premiumStatus: requestedStatus || null,
+      subscription_status: subscriptionStatus,
+      subscription_grace_until: nextGraceUntilMs ? dateFromMillis(nextGraceUntilMs) : null,
+      subscription_current_period_end: state.currentPeriodEnd || null,
       stripeCustomerId: state.stripeCustomerId || existing.stripeCustomerId || undefined,
       stripeSubscriptionId: state.stripeSubscriptionId || existing.stripeSubscriptionId || null,
       stripePriceId: state.stripePriceId || existing.stripePriceId || null,
       stripeCancelAtPeriodEnd: state.cancelAtPeriodEnd === undefined ? null : !!state.cancelAtPeriodEnd,
       stripeCurrentPeriodEnd: state.currentPeriodEnd || null,
       stripeTrialEnd: state.trialEnd || null,
-      premiumPaymentProblem: state.paymentProblem === undefined ? existing.premiumPaymentProblem : !!state.paymentProblem,
+      premiumPaymentProblem: paymentProblem,
       updatedAt: FieldValue.serverTimestamp()
     }), { merge: true });
   });
@@ -1081,7 +1347,8 @@ async function writeStripePremiumState(uid, state) {
       premium: isPremium,
       isPremium,
       subscriptionPlan: isPremium ? 'stripe' : null,
-      premiumStatus: state.status || null,
+      premiumStatus: requestedStatus || null,
+      subscriptionStatus: paymentProblem ? 'past_due' : (isPremium ? 'active' : (requestedStatus || 'inactive')),
       stripeCurrentPeriodEnd: state.currentPeriodEnd || null
     }),
     syncMeta: {
@@ -1104,12 +1371,12 @@ async function syncStripeSubscription(subscription, fallbackUid) {
   uid = userRef.id;
 
   const status = String(subscription.status || '').toLowerCase();
-  const accessStatuses = new Set(['active', 'trialing', 'past_due']);
+  const paidStatuses = new Set(['active', 'trialing']);
   const firstItem = subscription.items && subscription.items.data && subscription.items.data[0];
   const priceId = firstItem && firstItem.price && firstItem.price.id;
 
   await writeStripePremiumState(uid, {
-    isPremium: accessStatuses.has(status),
+    isPremium: paidStatuses.has(status),
     status,
     stripeCustomerId: customerId,
     stripeSubscriptionId: subscription.id,
@@ -1171,13 +1438,20 @@ async function handleStripeWebhook(req, res) {
     } else if (event.type === 'invoice.payment_succeeded' || event.type === 'invoice.payment_failed') {
       const invoice = event.data.object || {};
       const customerId = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer && invoice.customer.id;
+      const subscriptionId = typeof invoice.subscription === 'string' ? invoice.subscription : invoice.subscription && invoice.subscription.id;
+      if (subscriptionId) {
+        const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+        await syncStripeSubscription(subscription);
+        return res.json({ received: true });
+      }
       const userRef = await findUserRefByStripeCustomer(customerId);
       if (userRef) {
-        await userRef.set({
-          premiumPaymentProblem: event.type === 'invoice.payment_failed',
-          premiumStatus: event.type === 'invoice.payment_failed' ? 'payment_failed' : 'active',
-          updatedAt: FieldValue.serverTimestamp()
-        }, { merge: true });
+        await writeStripePremiumState(userRef.id, {
+          isPremium: event.type === 'invoice.payment_succeeded',
+          status: event.type === 'invoice.payment_failed' ? 'past_due' : 'active',
+          stripeCustomerId: customerId,
+          paymentProblem: event.type === 'invoice.payment_failed'
+        });
       }
     }
 
@@ -1283,7 +1557,7 @@ function pruneKeyedLog(log, keepKey) {
 function getServerAIQuotaState(userDoc, nowUtc) {
   const zone = getValidTimezone(userDoc.timezone);
   const localNow = nowUtc.setZone(zone);
-  const isAdvanced = !!(userDoc.isAdmin || userDoc.isPremium);
+  const isAdvanced = hasPremiumAccess(userDoc);
   return {
     isAdvanced,
     limit: isAdvanced ? AI_LIMITS.advancedPerDay : AI_LIMITS.freePerMonth,
@@ -1408,6 +1682,55 @@ app.get('/api/push/public-key', function(req, res) {
   res.json({ publicKey: process.env.VAPID_PUBLIC_KEY });
 });
 
+app.get('/api/access/status', async function(req, res) {
+  const auth = await requireFirebaseAuth(req, res);
+  if (!auth) return;
+
+  try {
+    const guard = await ensureTrialAndAccessState(auth, {
+      timezone: req.query.timezone || ''
+    });
+    res.json({
+      ok: true,
+      access: serializeAccessState(guard.access),
+      trialPopup: guard.popup,
+      user: {
+        uid: auth.uid,
+        isAdmin: guard.access.isAdmin === true,
+        hasAccess: guard.access.allowed === true,
+        subscriptionStatus: guard.access.subscriptionStatus,
+        trialEndDate: isoFromMillis(guard.access.trialEndMs)
+      }
+    });
+  } catch (err) {
+    console.error('Access status failed:', err.message);
+    jsonError(res, 500, 'access_status_failed', 'Could not verify your free trial. Please try again.');
+  }
+});
+
+app.post('/api/access/trial-popup-seen', async function(req, res) {
+  const auth = await requireFirebaseAuth(req, res);
+  if (!auth) return;
+
+  const day = parseInt((req.body || {}).day, 10);
+  if (!APP_TRIAL_POPUP_DAYS.has(day)) {
+    return jsonError(res, 400, 'invalid_trial_popup_day', 'Invalid trial popup day.');
+  }
+
+  try {
+    await db.collection('users').doc(auth.uid).set({
+      trialPopupSeenDays: {
+        [String(day)]: FieldValue.serverTimestamp()
+      },
+      updatedAt: FieldValue.serverTimestamp()
+    }, { merge: true });
+    res.json({ ok: true, day });
+  } catch (err) {
+    console.error('Trial popup seen failed:', err.message);
+    jsonError(res, 500, 'trial_popup_seen_failed', 'Could not save this trial reminder.');
+  }
+});
+
 app.post('/api/stripe/create-checkout-session', async function(req, res) {
   const auth = await requireFirebaseAuth(req, res);
   if (!auth) return;
@@ -1415,15 +1738,19 @@ app.post('/api/stripe/create-checkout-session', async function(req, res) {
 
   try {
     const requestBody = req.body || {};
-    const wantsTrial = requestBody.trial !== false && requestBody.skipTrial !== true && requestBody.checkoutMode !== 'direct';
+    const wantsTrial = ALLOW_STRIPE_TRIAL_CHECKOUT && requestBody.trial === true && requestBody.skipTrial !== true && requestBody.checkoutMode !== 'direct';
     const selectedPlan = String(requestBody.plan || 'monthly').toLowerCase() === 'yearly' ? 'yearly' : 'monthly';
     const lineItem = getStripeLineItemForPlan(selectedPlan);
     const userRef = db.collection('users').doc(auth.uid);
     const userSnap = await userRef.get();
     const userDoc = userSnap.exists ? (userSnap.data() || {}) : {};
     const customerId = await ensureStripeCustomer(auth, userRef, userDoc);
+    const access = buildAccessState(userDoc, DateTime.utc());
+    const existingStatus = getSubscriptionStatus(userDoc);
+    const hasStripeSubscription = !!(userDoc.stripeCustomerId && userDoc.stripeSubscriptionId);
 
-    if (userDoc.isPremium === true && userDoc.subscriptionPlan === 'stripe') {
+    if ((access.state === 'subscribed' && userDoc.subscriptionPlan === 'stripe')
+      || (hasStripeSubscription && ['active', 'trialing', 'past_due', 'unpaid'].includes(existingStatus))) {
       const portal = await stripe.billingPortal.sessions.create({
         customer: customerId,
         return_url: STRIPE_SUCCESS_URL
@@ -1431,7 +1758,7 @@ app.post('/api/stripe/create-checkout-session', async function(req, res) {
       return res.json({ ok: true, url: portal.url, mode: 'portal' });
     }
 
-    if (userDoc.isPremium === true || userDoc.isAdmin === true) {
+    if (access.isAdmin === true || (access.state === 'subscribed' && userDoc.subscriptionPlan !== 'stripe')) {
       return res.json({ ok: true, alreadyPremium: true });
     }
 
@@ -1503,6 +1830,8 @@ app.post('/api/stripe/create-portal-session', async function(req, res) {
 app.post('/api/feedback', async function(req, res) {
   const auth = await requireFirebaseAuth(req, res);
   if (!auth) return;
+  const accessGuard = await requireActiveAppAccess(req, res, auth);
+  if (!accessGuard) return;
 
   try {
     const body = req.body || {};
@@ -1849,6 +2178,8 @@ app.post('/api/promo/redeem', async function(req, res) {
 app.post('/api/push/subscribe', async function(req, res) {
   const auth = await requireFirebaseAuth(req, res);
   if (!auth) return;
+  const accessGuard = await requireActiveAppAccess(req, res, auth);
+  if (!accessGuard) return;
 
   const { email, displayName, timezone, notificationsEnabled, subscription, clientDeviceId } = req.body || {};
   const uid = auth.uid;
@@ -1917,8 +2248,10 @@ app.post('/api/reminders/register', async function(req, res) {
     return res.json({ ok: true, action: 'cancelled' });
   }
 
-  const userSnap = await db.collection('users').doc(auth.uid).get();
-  const userDoc = userSnap.exists ? (userSnap.data() || {}) : {};
+  const accessGuard = await requireActiveAppAccess(req, res, auth);
+  if (!accessGuard) return;
+
+  const userDoc = accessGuard.userDoc || {};
   const zone = getValidTimezone(body.timezone || userDoc.timezone);
   const dueMoment = findNextReminderMoment(reminder, zone, DateTime.utc());
   if (dueMoment) {
@@ -1938,10 +2271,11 @@ app.post('/api/reminders/register', async function(req, res) {
 app.post('/api/reminders/sync', async function(req, res) {
   const auth = await requireFirebaseAuth(req, res);
   if (!auth) return;
+  const accessGuard = await requireActiveAppAccess(req, res, auth);
+  if (!accessGuard) return;
 
   const body = req.body || {};
-  const userSnap = await db.collection('users').doc(auth.uid).get();
-  const userDoc = userSnap.exists ? (userSnap.data() || {}) : {};
+  const userDoc = accessGuard.userDoc || {};
   const zone = getValidTimezone(body.timezone || userDoc.timezone);
   const result = await reconcileRegisteredReminderSchedules(auth.uid, body.reminders, zone);
   res.json({ ok: true, scheduled: result.scheduled, removed: result.removed });
@@ -1950,6 +2284,8 @@ app.post('/api/reminders/sync', async function(req, res) {
 app.post('/api/chat', async function(req, res) {
   const auth = await requireFirebaseAuth(req, res);
   if (!auth) return;
+  const accessGuard = await requireActiveAppAccess(req, res, auth);
+  if (!accessGuard) return;
 
   const { message, context, history = [], tier = 'standard' } = req.body || {};
   const safeMessage = sanitizeMessageText(message, 2400);
@@ -2048,9 +2384,10 @@ async function processScheduledNotifications() {
 
     const userDataSnap = await db.collection('userData').doc(uid).get();
     const userData = userDataSnap.exists ? (userDataSnap.data() || {}) : {};
-    const notificationMeta = pruneNotificationMeta(userDoc.notificationMeta || {}, nowUtc.toMillis());
-    const premiumAccess = hasPremiumAccess(userDoc);
-    const reminders = (userData.reminders || []).filter((item) => item && item.enabled !== false && (premiumAccess || item.smart !== true));
+	    const notificationMeta = pruneNotificationMeta(userDoc.notificationMeta || {}, nowUtc.toMillis());
+	    const premiumAccess = hasPremiumAccess(userDoc);
+	    if (!premiumAccess) continue;
+	    const reminders = (userData.reminders || []).filter((item) => item && item.enabled !== false && (premiumAccess || item.smart !== true));
     let changed = false;
 
     for (const slot of SMART_NOTIFICATION_SLOTS) {
